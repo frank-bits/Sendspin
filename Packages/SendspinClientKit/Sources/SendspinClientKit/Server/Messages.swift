@@ -1,0 +1,469 @@
+import Foundation
+
+// Sendspin 1 messages (github.com/Sendspin/spec, messaging.md and roles/player/v1.md).
+// JSON messages are `{"type": "...", "payload": {...}}`. Decoders ignore unknown
+// fields, as the spec requires.
+
+// MARK: - Handshake (cleartext)
+
+public struct ClientInit: Decodable, Sendable {
+    public var clientID: String
+    public var version: Int
+    public var suite: String
+
+    enum CodingKeys: String, CodingKey {
+        case version, suite
+        case clientID = "client_id"
+    }
+
+    /// Why a client/init isn't accepted: the `server/error` reason.
+    enum Failure: String, Error {
+        case malformed
+        case unsupportedVersion = "unsupported_version"
+        case unsupportedSuite = "unsupported_suite"
+    }
+
+    private struct VersionField: Decodable { var version: Int }
+    private struct SuiteField: Decodable { var suite: String }
+
+    /// Parse client/init, checking `version` first, then `suite`, then the rest: a version
+    /// other than 1 is `unsupported_version` whatever the other fields hold
+    /// (connection.md, Failure Handling).
+    static func parse(_ data: Data) throws(Failure) -> (ClientInit, NoiseSuite) {
+        guard (try? MessageCoding.type(of: data)) == "client/init",
+              let version = try? MessageCoding.payload(VersionField.self, from: data).version
+        else { throw .malformed }
+        guard version == 1 else { throw .unsupportedVersion }
+        guard let suiteName = try? MessageCoding.payload(SuiteField.self, from: data).suite else { throw .malformed }
+        guard let suite = NoiseSuite(rawValue: suiteName) else { throw .unsupportedSuite }
+        guard let clientInit = try? MessageCoding.payload(ClientInit.self, from: data) else { throw .malformed }
+        return (clientInit, suite)
+    }
+}
+
+public struct ServerInit: Encodable, Sendable {
+    public var serverID: String
+    public var version = 1
+
+    enum CodingKeys: String, CodingKey {
+        case version
+        case serverID = "server_id"
+    }
+}
+
+public struct ServerError: Encodable, Sendable {
+    public var reason: String
+}
+
+struct NoiseMessage1Payload: Encodable {
+    var pskID: String
+    var pskCategory: String
+
+    enum CodingKeys: String, CodingKey {
+        case pskID = "psk_id"
+        case pskCategory = "psk_category"
+    }
+}
+
+// MARK: - Client -> server
+
+public struct DeviceInfo: Codable, Sendable {
+    public var productName: String?
+    public var manufacturer: String?
+    public var softwareVersion: String?
+
+    enum CodingKeys: String, CodingKey {
+        case manufacturer
+        case productName = "product_name"
+        case softwareVersion = "software_version"
+    }
+}
+
+public struct VisualizerSupport: Codable, Sendable {
+    /// Bytes of visualizer messages it can hold.
+    public var bufferCapacity: Int
+
+    enum CodingKeys: String, CodingKey {
+        case bufferCapacity = "buffer_capacity"
+    }
+}
+
+public struct SourceSupport: Codable, Sendable {
+    public struct Features: Codable, Sendable {
+        /// It reports `signal` in client/state.
+        public var lineSense: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case lineSense = "line_sense"
+        }
+    }
+
+    public var features: Features?
+}
+
+public struct UnpairedAccess: Codable, Sendable {
+    public var enabled: Bool
+}
+
+public struct ClientHello: Decodable, Sendable {
+    public var name: String
+    public var deviceInfo: DeviceInfo?
+    public var supportedRoles: [String]
+    public var playerSupport: PlayerSupport?
+    public var visualizerSupport: VisualizerSupport?
+    public var sourceSupport: SourceSupport?
+    public var unpairedAccess: UnpairedAccess?
+    public var supportedPairMethods: PairMethods?
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case deviceInfo = "device_info"
+        case supportedRoles = "supported_roles"
+        case playerSupport = "player@v1_support"
+        case visualizerSupport = "visualizer@v1_support"
+        case sourceSupport = "source@v1_support"
+        case unpairedAccess = "unpaired_access"
+        case supportedPairMethods = "supported_pair_methods"
+    }
+}
+
+/// The pairing methods a client offers (pairing.md, client/hello pair-method descriptor).
+/// Unknown methods, formats and channels are ignored; a dynamic code with no format or
+/// channel we know counts as not offered.
+public struct PairMethods: Decodable, Sendable, Equatable {
+    public enum Location: String, Sendable { case device, leaflet, `operator` }
+    public enum OutChannel: String, Sendable { case display, speaker }
+
+    /// Where the operator finds the pairing token, if offered (every client must).
+    public var pairingPSK: [Location]?
+    /// Where the 8-digit static code is: on the device, a leaflet, or set by the operator.
+    public var staticCode: [Location]?
+    /// How the device conveys its dynamic code, if it offers one in the digits format.
+    public var dynamicCode: [OutChannel]?
+    /// Its out-channels, if it offers the dynamic code as a QR code (`qr_code`).
+    public var dynamicQRCode: [OutChannel]?
+    /// What was ignored as unknown: methods, formats, channels and locations, as `method` or
+    /// `method.value`. Servers SHOULD track these: the client speaks a newer revision.
+    public var ignored: [String] = []
+
+    public init(pairingPSK: [Location]? = nil, staticCode: [Location]? = nil, dynamicCode: [OutChannel]? = nil) {
+        self.pairingPSK = pairingPSK
+        self.staticCode = staticCode
+        self.dynamicCode = dynamicCode
+    }
+
+    private struct Descriptor: Decodable {
+        var locations: [String]?
+        var outChannels: [String]?
+        var formats: [String]?
+
+        enum CodingKeys: String, CodingKey {
+            case locations
+            case outChannels = "out_channels"
+            case formats
+        }
+    }
+
+    private struct Key: CodingKey {
+        var stringValue: String
+        var intValue: Int? { nil }
+        init(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { nil }
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: Key.self)
+        func descriptor(_ key: String) -> Descriptor? {
+            try? container.decodeIfPresent(Descriptor.self, forKey: Key(stringValue: key))
+        }
+        var ignored: [String] = []
+        func known<T: RawRepresentable<String>>(_ values: [String]?, in method: String, as _: T.Type) -> [T] {
+            (values ?? []).compactMap { value in
+                guard let known = T(rawValue: value) else { ignored.append("\(method).\(value)"); return nil }
+                return known
+            }
+        }
+        if let psk = descriptor("pairing_psk") { pairingPSK = known(psk.locations, in: "pairing_psk", as: Location.self) }
+        if let code = descriptor("static_pairing_code") {
+            staticCode = known(code.locations, in: "static_pairing_code", as: Location.self)
+        }
+        if let code = descriptor("dynamic_pairing_code") {
+            ignored += (code.formats ?? []).filter { !["digits", "qr_code"].contains($0) }.map { "dynamic_pairing_code.\($0)" }
+            let channels = known(code.outChannels, in: "dynamic_pairing_code", as: OutChannel.self)
+            if (code.formats ?? []).contains("digits"), !channels.isEmpty { dynamicCode = channels }
+            if (code.formats ?? []).contains("qr_code"), !channels.isEmpty { dynamicQRCode = channels }
+        }
+        let methods = ["pairing_psk", "static_pairing_code", "dynamic_pairing_code"]
+        ignored += container.allKeys.map(\.stringValue).filter { !methods.contains($0) }.sorted()
+        self.ignored = ignored
+    }
+}
+
+public struct ClientTime: Codable, Sendable {
+    public var clientTransmitted: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case clientTransmitted = "client_transmitted"
+    }
+}
+
+/// The `player` object of client/state.
+public struct ReportedPlayerState: Decodable, Sendable {
+    public var volume: Int?
+    public var muted: Bool?
+    public var outputDelayMs: Int?
+    public var requiredLeadTimeMs: Int?
+    public var minBufferMs: Int?
+    /// Commands the server may send: "volume", "mute", "set_output_delay".
+    public var supportedCommands: [String]?
+
+    enum CodingKeys: String, CodingKey {
+        case volume, muted
+        case outputDelayMs = "output_delay_ms"
+        case requiredLeadTimeMs = "required_lead_time_ms"
+        case minBufferMs = "min_buffer_ms"
+        case supportedCommands = "supported_commands"
+    }
+}
+
+public struct ClientState: Decodable, Sendable {
+    /// `false` while the player is in use by something else and won't yield.
+    public var available: Bool
+    public var player: ReportedPlayerState?
+    public var visualizer: VisualizerConfig?
+    public var artwork: ArtworkConfig?
+    public var source: SourceState?
+}
+
+/// The `source` object of client/state.
+public struct SourceState: Decodable, Sendable {
+    /// 'present' or 'absent', from a source with line sensing.
+    public var signal: String?
+}
+
+/// client-stream/start: the format of a source's input stream (roles/source/v1.md).
+public struct ClientStreamStart: Decodable, Sendable {
+    public struct Source: Decodable, Sendable {
+        public var codec: String
+        public var channels: Int
+        public var sampleRate: Int
+        public var bitDepth: Int
+        public var codecHeader: String?
+
+        enum CodingKeys: String, CodingKey {
+            case codec, channels
+            case sampleRate = "sample_rate"
+            case bitDepth = "bit_depth"
+            case codecHeader = "codec_header"
+        }
+    }
+
+    public var source: Source
+}
+
+/// The `artwork` object of client/state, and of stream/start (roles/artwork/v1.md).
+public struct ArtworkConfig: Codable, Sendable, Equatable {
+    public struct Channel: Codable, Sendable, Equatable {
+        /// 'album', 'artist' or 'none'.
+        public var source: String
+        /// 'jpeg' or 'png'; with the size, required unless the source is 'none'.
+        public var format: String?
+        public var width: Int?
+        public var height: Int?
+    }
+
+    public var channels: [Channel]
+
+    static let maxChannels = 4
+
+    /// More than four channels, or a channel without its format and size: a protocol error.
+    var isMalformed: Bool {
+        channels.count > Self.maxChannels
+            || channels.contains { $0.source != "none" && ($0.format == nil || $0.width == nil || $0.height == nil) }
+    }
+
+    /// For stream/start: the same channels, without those after the last streamed one.
+    var streamed: ArtworkConfig {
+        ArtworkConfig(channels: Array(channels.prefix((channels.lastIndex { $0.source != "none" } ?? -1) + 1)))
+    }
+}
+
+/// The `controller` object of client/command (roles/controller/v1.md).
+public struct ControllerCommand: Decodable, Sendable {
+    public var command: String
+    public var volume: Int?
+    public var mute: Bool?
+    /// For 'seek': the position in the track, in milliseconds.
+    public var positionMs: Int?
+    /// For 'seek_relative': how far to move, in milliseconds.
+    public var offsetMs: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case command, volume, mute
+        case positionMs = "position_ms"
+        case offsetMs = "offset_ms"
+    }
+}
+
+public struct ClientCommand: Decodable, Sendable {
+    public var controller: ControllerCommand?
+}
+
+public struct ClientGoodbye: Decodable, Sendable {
+    public var reason: String
+}
+
+// MARK: - Server -> client
+
+public struct ServerHello: Encodable, Sendable {
+    public struct SourceSupport: Encodable, Sendable {
+        /// Every server must accept FLAC and PCM input (roles/source/v1.md).
+        public var supportedCodecs = ["flac", "pcm"]
+
+        enum CodingKeys: String, CodingKey {
+            case supportedCodecs = "supported_codecs"
+        }
+    }
+
+    public var name: String
+    public var sourceSupport = SourceSupport()
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case sourceSupport = "source@v1_support"
+    }
+}
+
+public struct ServerActivate: Encodable, Sendable {
+    /// The pairing attempt a `pairing` activity admits (messaging.md, server/activate).
+    public struct Pairing: Encodable, Sendable {
+        public var method: String
+        /// The dynamic code's emission format; absent for the other methods.
+        public var format: String?
+    }
+
+    public var activities: [String]
+    public var activeRoles: [String]
+    public var pairing: Pairing?
+
+    public init(activities: [String], activeRoles: [String], pairing: Pairing? = nil) {
+        self.activities = activities
+        self.activeRoles = activeRoles
+        self.pairing = pairing
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case activities, pairing
+        case activeRoles = "active_roles"
+    }
+}
+
+public struct ServerTime: Encodable, Sendable {
+    public var clientTransmitted: Int64
+    public var serverReceived: Int64
+    public var serverTransmitted: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case clientTransmitted = "client_transmitted"
+        case serverReceived = "server_received"
+        case serverTransmitted = "server_transmitted"
+    }
+}
+
+public struct GroupUpdate: Encodable, Equatable, Sendable {
+    public var playbackState: String
+    public var groupID: String
+    public var groupName: String
+
+    enum CodingKeys: String, CodingKey {
+        case playbackState = "playback_state"
+        case groupID = "group_id"
+        case groupName = "group_name"
+    }
+}
+
+public struct StreamStartPlayer: Encodable, Sendable {
+    public var codec: String
+    public var sampleRate: Int
+    public var channels: Int
+    public var bitDepth: Int
+    public var codecHeader: String?
+
+    enum CodingKeys: String, CodingKey {
+        case codec, channels
+        case sampleRate = "sample_rate"
+        case bitDepth = "bit_depth"
+        case codecHeader = "codec_header"
+    }
+}
+
+public struct StreamStart: Encodable, Sendable {
+    public var serverTransmitted: Int64
+    public var player: StreamStartPlayer?
+    public var visualizer: VisualizerConfig?
+    public var artwork: ArtworkConfig?
+
+    enum CodingKeys: String, CodingKey {
+        case player, visualizer, artwork
+        case serverTransmitted = "server_transmitted"
+    }
+}
+
+/// The `controller` object of server/state: the state of the client's whole group.
+public struct GroupControllerState: Encodable, Equatable, Sendable {
+    public var supportedCommands: [String]
+    public var volume: Int
+    public var muted: Bool
+    /// "off" and false unless the group plays a queue (`MediaControls`).
+    public var repeatMode = "off"
+    public var shuffle = false
+    /// How far a 'seek' may go; sent whenever 'seek' is offered.
+    public var seekMaxMs: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case volume, muted, shuffle
+        case supportedCommands = "supported_commands"
+        case repeatMode = "repeat"
+        case seekMaxMs = "seek_max_ms"
+    }
+}
+
+/// The `color` object of server/state, with a timestamp and nothing else: there's no artwork
+/// analysis to take colors from.
+public struct TimestampOnlyState: Encodable, Sendable {
+    public var timestamp: Int64
+}
+
+public struct ServerState: Encodable, Sendable {
+    public var controller: GroupControllerState?
+    public var metadata: MetadataState?
+    public var color: TimestampOnlyState?
+}
+
+public struct StreamEnd: Encodable, Sendable {
+    public var roles: [String]
+}
+
+public struct PlayerCommand: Encodable, Sendable {
+    public var command: String
+    public var volume: Int?
+    public var mute: Bool?
+
+    public static func volume(_ level: Int) -> PlayerCommand {
+        PlayerCommand(command: "volume", volume: level)
+    }
+
+    public static func mute(_ muted: Bool) -> PlayerCommand {
+        PlayerCommand(command: "mute", mute: muted)
+    }
+}
+
+public struct SourceCommand: Encodable, Sendable {
+    /// 'start' or 'stop'.
+    public var command: String
+}
+
+public struct ServerCommand: Encodable, Sendable {
+    public var player: PlayerCommand?
+    public var source: SourceCommand?
+}
