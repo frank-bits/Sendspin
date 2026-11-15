@@ -118,6 +118,17 @@ public actor ClientSession {
         (events, emit) = AsyncStream.makeStream()
     }
 
+    /// A session with a server that connected to us (connection.md, Server Initiated
+    /// Connections): the same exchange, on its connection.
+    public init(incoming connection: IncomingConnection, store: CredentialStore, configuration: ClientConfiguration,
+                status: ClientStatus = ClientStatus(available: true)) {
+        socket = connection.socket
+        self.store = store
+        self.configuration = configuration
+        self.status = status
+        (events, emit) = AsyncStream.makeStream()
+    }
+
     // MARK: Connection
 
     /// Connect and serve until the connection ends; `events` finishes with `.closed`.

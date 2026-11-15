@@ -7,10 +7,11 @@ import SendspinClientKit
 @main
 struct Probe {
     static let usage = """
-        usage: sendspin-probe [--url ws://host:port/path] [--name NAME] [--seconds N]
+        usage: sendspin-probe [--url ws://host:port/path | --listen] [--name NAME] [--seconds N]
                               [--state FILE] [--show-token] [--verbose]
 
           --url         connect here instead of discovering a server over mDNS
+          --listen      announce this client and wait for servers to connect, as hardware speakers do
           --name        friendly name shown on the server (default: this Mac's host name)
           --seconds     how long to stay connected (default 20; use more to pair)
           --state       credentials file (default: ~/Library/Application Support/sendspin-probe/credentials.json)
@@ -28,6 +29,7 @@ struct Probe {
         var statePath: String?
         var showToken = false
         var play = false
+        var listen = false
         var arguments = CommandLine.arguments.dropFirst().makeIterator()
         while let argument = arguments.next() {
             switch argument {
@@ -37,6 +39,7 @@ struct Probe {
             case "--state": statePath = arguments.next()
             case "--show-token": showToken = true
             case "--play": play = true
+            case "--listen": listen = true
             case "--verbose": Log.minimumLevel = .debug
             default:
                 print(usage)
@@ -60,6 +63,29 @@ struct Probe {
             do { try saveCredentials(changed, at: stateURL) } catch { print("Saving credentials failed: \(error)") }
         }
 
+        let configuration = ClientConfiguration(
+            name: name, productName: "sendspin-probe", manufacturer: "SendspinClientKit", softwareVersion: "0.0.1",
+            supportedRoles: ["player@v1", "controller@v1", "metadata@v1"], playerSupport: PlayerEngine.support())
+        // Without --play the probe can't output audio, so it isn't available for playback.
+        let status = ClientStatus(available: play, player: PlayerEngine.state(volume: 100, muted: false))
+
+        if listen {
+            let listener = ServiceListener(name: name, kind: .client)
+            listener.start()
+            print("announced as \(name); waiting for servers to connect")
+            Task {
+                try? await Task.sleep(for: .seconds(seconds))
+                exit(0)
+            }
+            // Several servers may connect, as Music Assistant does to anything announced.
+            for await connection in listener.connections {
+                print("a server connected from \(connection.remoteDescription)")
+                let session = ClientSession(incoming: connection, store: store, configuration: configuration, status: status)
+                Task { _ = await serve(session, play: play, seconds: nil) }
+            }
+            exit(0)
+        }
+
         let url: URL
         if let urlArgument {
             guard let given = URL(string: urlArgument), given.scheme == "ws", given.host() != nil else {
@@ -75,19 +101,20 @@ struct Probe {
             url = found
         }
         print("connecting to \(url.absoluteString)")
-
-        let configuration = ClientConfiguration(
-            name: name, productName: "sendspin-probe", manufacturer: "SendspinClientKit", softwareVersion: "0.0.1",
-            supportedRoles: ["player@v1", "controller@v1", "metadata@v1"], playerSupport: PlayerEngine.support())
-        // Without --play the probe can't output audio, so it isn't available for playback.
-        let status = ClientStatus(available: play, player: PlayerEngine.state(volume: 100, muted: false))
         let session = ClientSession(url: url, store: store, configuration: configuration, status: status)
+        exit(await serve(session, play: play, seconds: seconds) ? 0 : 1)
+    }
+
+    /// Run one session to its end, logging what happens; whether the server activated it.
+    static func serve(_ session: ClientSession, play: Bool, seconds: Int?) async -> Bool {
         let engine = play ? PlayerEngine(session: session) : nil
 
         Task { await session.run() }
-        Task {
-            try? await Task.sleep(for: .seconds(seconds))
-            await session.close(goodbye: "shutdown")
+        if let seconds {
+            Task {
+                try? await Task.sleep(for: .seconds(seconds))
+                await session.close(goodbye: "shutdown")
+            }
         }
 
         var activated = false
@@ -127,7 +154,7 @@ struct Probe {
                 print("closed: \(reason ?? "clean")")
             }
         }
-        exit(activated ? 0 : 1)
+        return activated
     }
 
     /// The first server seen within 5 s, resolved to its URL.

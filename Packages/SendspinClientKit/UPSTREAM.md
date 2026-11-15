@@ -38,6 +38,7 @@ Tests copied with only the module name changed: `NoiseTests.swift`, `CPaceTests.
 Copied unchanged from `Packages/SendspinServerKit/Sources/SendspinServerKit/`:
 
 - `Protocol/AudioFrame.swift`, `PlayerPairings.swift`, `Noise/ServerIdentity.swift`
+- `Discovery/PlayerBrowser.swift` (without `OnceFlag`, which `Upstream/Support.swift` has)
 - `Audio/PCM.swift`, `Audio/FLACEncoder.swift`, `Audio/PlayerAudioPipeline.swift`,
   `Audio/InputTimeline.swift`, `Audio/Visualizer.swift`
 

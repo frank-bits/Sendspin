@@ -6,24 +6,33 @@ import TandemServerKit
 // music on the Sendspin players that connect to it. Commands are typed on standard input.
 
 let usage = """
-usage: tandem-server --music <folder> [--name <name>] [--data <folder>] [--api-port <port>] [--debug]
+usage: tandem-server --music <folder> [--name <name>] [--data <folder>] [--api-port <port>] [--loopback] [--debug]
 
 Then, on standard input:
   players            list the players that are connected
   pair <n>           pair with player n; it shows a code
-  code <n> <digits>  enter the code player n shows
+  code <n> <digits>  enter the code player n shows; the code alone will do when only
+                     one player waits for it
   allow <n>          let player n play without pairing, if it admits that
   forget <n>         forget player n's pairing
+  use <n>            take player n back, after another server had it
   rescan             read the music folder again
   quit
 """
 
+// Unbuffered, so what it prints reaches a log file as it happens.
+setvbuf(stdout, nil, _IONBF, 0)
+
 var options: [String: String] = [:]
+var loopback = false
 var arguments = Array(CommandLine.arguments.dropFirst())
 while !arguments.isEmpty {
     let flag = arguments.removeFirst()
     if flag == "--debug" {
         Log.minimumLevel = .debug
+    } else if flag == "--loopback" {
+        // Test players on this machine announce a loopback address.
+        loopback = true
     } else if flag.hasPrefix("--"), !arguments.isEmpty {
         options[String(flag.dropFirst(2))] = arguments.removeFirst()
     } else {
@@ -43,18 +52,27 @@ let server = StandaloneServer(configuration: .init(
     dataDirectory: options["data"].map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
         ?? support.appendingPathComponent("Tandem Server"),
     musicFolder: musicFolder,
-    apiPort: options["api-port"].flatMap(UInt16.init) ?? 8929))
+    apiPort: options["api-port"].flatMap(UInt16.init) ?? 8929, dialsLoopback: loopback))
 
 func describe(_ player: StandaloneServer.Player) -> String {
     var text = "\(player.name): "
-    switch player.connection {
-    case .connected: text += player.paired ? "playing in the group" : "playing in the group, not paired"
-    case .pairingRequired: text += "needs pairing"
-    case .notRecognized: text += "lost its pairing with this server; pair it again"
-    case .awaitingApproval: text += "waits to be allowed"
-    case .left: text += "left the group"
-    case .connecting: text += "connecting"
-    default: text += "\(player.connection)"
+    // While it pairs, that is all there is to say.
+    let pairing = player.pairing.map { progress in
+        if case .paired = progress { false } else if case .failed = progress { false } else { true }
+    } ?? false
+    switch pairing ? nil : player.connection {
+    case nil: text += "pairing"
+    case .connected?: text += player.paired ? "playing in the group" : "playing in the group, not paired"
+    case .pairingRequired?: text += "needs pairing"
+    case .notRecognized?: text += "lost its pairing with this server; pair it again"
+    case .awaitingApproval?: text += "waits to be allowed"
+    case .left?: text += "left the group"
+    case .connecting?: text += "connecting"
+    case .taken?: text += "in use by another server; 'use' takes it back"
+    case .unavailable?: text += "can't be reached"
+    case .notApproved?: text += "isn't the device that was allowed"
+    case .disconnected?: text += "not connected"
+    case .failed(let reason)?: text += "failed (\(reason))"
     }
     switch player.pairing {
     case .enteringCode?: text += " - enter the code it shows"
@@ -64,6 +82,15 @@ func describe(_ player: StandaloneServer.Player) -> String {
     default: break
     }
     return text
+}
+
+/// Enter a code as it was typed: its digits, whatever separates them.
+func enter(_ code: String, for player: StandaloneServer.Player) async {
+    guard case .enteringCode = player.pairing else {
+        print("\(player.name) isn't waiting for a code. Start with: pair <n>")
+        return
+    }
+    await server.enterCode(code.filter(\.isNumber), for: player.id)
 }
 
 await server.start()
@@ -103,11 +130,13 @@ for try await line in FileHandle.standardInput.bytes.lines {
     case ("pair", let player?):
         await server.pair(player.id)
     case ("code", let player?) where words.count > 2:
-        await server.enterCode(words[2...].joined(), for: player.id)
+        await enter(words[2...].joined(), for: player)
     case ("allow", let player?):
         await server.allow(player.id)
     case ("forget", let player?):
         await server.forget(player.id)
+    case ("use", let player?):
+        await server.use(player.id)
     case ("rescan", _):
         await server.setMusicFolder(musicFolder)
     case ("quit", _), ("exit", _):
@@ -115,6 +144,18 @@ for try await line in FileHandle.standardInput.bytes.lines {
         exit(0)
     case (nil, _):
         break
+    case (let word?, _) where ["pair", "code", "allow", "forget", "use"].contains(word):
+        print(players.isEmpty ? "No players connected." : "Say which player by its number, as in: \(word) 1")
+    case _ where line.contains(where: \.isNumber) && line.allSatisfy({ $0.isNumber || $0 == "-" || $0 == " " }):
+        // A code typed alone, as the player shows it: "482-044".
+        let waiting = players.filter { if case .enteringCode = $0.pairing { true } else { false } }
+        if waiting.count == 1 {
+            await enter(line, for: waiting[0])
+        } else if waiting.isEmpty {
+            print("No player waits for a code. Start with: pair <n>")
+        } else {
+            print("More than one player waits for a code. Say which: code <n> <digits>")
+        }
     default:
         print(usage)
     }

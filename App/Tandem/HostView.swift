@@ -20,6 +20,13 @@ struct HostView: View {
                 if let error = host.state.error {
                     Section { Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(.red) }
                 }
+                if host.isEnabled, host.state.localNetworkDenied {
+                    Section {
+                        Label("Tandem isn't allowed on the local network, so it finds no speakers. Allow it in "
+                            + "System Settings, under Privacy & Security, Local Network.",
+                            systemImage: "exclamationmark.triangle")
+                    }
+                }
                 if host.isEnabled {
                     music
                     players
@@ -64,8 +71,8 @@ struct HostView: View {
     private var players: some View {
         Section {
             if host.state.players.isEmpty {
-                Text("No players yet. Open Tandem on an iPhone, iPad or Mac on this network and choose "
-                    + "“\(host.serverName)” as its server.")
+                Text("No players yet. Sendspin speakers on this network appear here by themselves. For an "
+                    + "iPhone, iPad or Mac, open Tandem on it and choose “\(host.serverName)” as its server.")
                     .foregroundStyle(.secondary)
             }
             ForEach(host.state.players) { PlayerRow(player: $0, host: host) }
@@ -138,7 +145,11 @@ private struct PlayerRow: View {
         case .awaitingApproval: return "Not allowed yet"
         case .left: return "Busy elsewhere"
         case .connecting: return "Connecting…"
-        default: return "Not connected"
+        case .taken: return "In use by another server"
+        case .unavailable: return "Can't be reached"
+        case .notApproved: return "Not the device that was allowed"
+        case .failed(let reason): return reason
+        case .disconnected: return "Not connected"
         }
     }
 
@@ -150,6 +161,9 @@ private struct PlayerRow: View {
             case .awaitingApproval:
                 if player.offersCode { Button("Pair…") { host.pair(player) } }
                 Button("Allow") { host.allow(player) }
+            case .taken, .left, .disconnected, .failed:
+                // Only a speaker the server connects to can be fetched back.
+                if player.found { Button("Use Here") { host.use(player) } }
             default:
                 EmptyView()
             }

@@ -13,12 +13,16 @@ public actor StandaloneServer {
         public var musicFolder: URL?
         /// The library API's port; another is used when it's taken.
         public var apiPort: UInt16
+        /// Connect to players that announce a loopback address too: test players on this machine.
+        public var dialsLoopback: Bool
 
-        public init(name: String, dataDirectory: URL, musicFolder: URL? = nil, apiPort: UInt16 = 8929) {
+        public init(name: String, dataDirectory: URL, musicFolder: URL? = nil, apiPort: UInt16 = 8929,
+                    dialsLoopback: Bool = false) {
             self.name = name
             self.dataDirectory = dataDirectory
             self.musicFolder = musicFolder
             self.apiPort = apiPort
+            self.dialsLoopback = dialsLoopback
         }
     }
 
@@ -32,6 +36,9 @@ public actor StandaloneServer {
         public var pairing: PairingProgress?
         /// It can show a code to pair with.
         public var offersCode: Bool
+        /// It announces itself on the network and the server connects to it, as hardware
+        /// speakers do; otherwise it connected to the server by itself.
+        public var found: Bool
     }
 
     public struct State: Sendable, Equatable {
@@ -39,6 +46,8 @@ public actor StandaloneServer {
         public var players: [Player] = []
         public var library = Library.Status.noFolder
         public var apiPort: Int?
+        /// The system refuses the server Local Network access, so it finds no players.
+        public var localNetworkDenied = false
         /// Why the server couldn't start.
         public var error: String?
 
@@ -62,6 +71,12 @@ public actor StandaloneServer {
     private var http: HTTPServer?
     private var listener: ServiceListener?
     private var accepting: Task<Void, Never>?
+    private var discovering: Task<Void, Never>?
+    private var identity: ServerIdentity?
+    private var pairings: PlayerPairings?
+    /// Players that announce themselves, which the server connects to, by player id: the name
+    /// they announce under, which stays when their address changes.
+    private var dialed: [String: DiscoveredPlayer] = [:]
     private var sessions: [String: PlayerSession] = [:]
     private var statuses: [String: PlayerStatus] = [:]
     /// Players whose pairing waits for the operator to enter the code they show.
@@ -105,6 +120,16 @@ public actor StandaloneServer {
                 Task { await self?.libraryChanged(status) }
             }
             (self.store, self.group, self.library, self.api, self.http, self.listener) = (store, group, library, api, http, listener)
+            (self.identity, self.pairings) = (identity, pairings)
+            PlayerBrowser.allowsLoopback = configuration.dialsLoopback
+            let denied: @Sendable (Bool) -> Void = { [weak self] denied in
+                Task { await self?.localNetwork(denied: denied) }
+            }
+            discovering = Task { [weak self] in
+                for await players in PlayerBrowser.browse(localNetworkDenied: denied) {
+                    await self?.found(players)
+                }
+            }
             state.error = nil
             state.apiPort = Int(port)
             state.running = true
@@ -119,6 +144,7 @@ public actor StandaloneServer {
     public func stop() async {
         guard state.running else { return }
         accepting?.cancel()
+        discovering?.cancel()
         listener?.stop()
         http?.stop()
         for request in codeRequests.values { request.resume(returning: nil) }
@@ -127,6 +153,7 @@ public actor StandaloneServer {
         await group?.shutdown()
         await library?.load(folder: nil)
         (store, group, library, api, http, listener) = (nil, nil, nil, nil, nil, nil)
+        (identity, pairings, dialed) = (nil, nil, [:])
         sessions = [:]
         statuses = [:]
         state = State()
@@ -153,17 +180,83 @@ public actor StandaloneServer {
         }
         let id = session.url.absoluteString
         sessions[id] = session
-        Task { [weak self] in
-            for await status in session.updates { await self?.update(id, status) }
-            await self?.remove(id)
-        }
+        follow(session, as: id)
         await group.add(session)
     }
 
-    private func update(_ id: String, _ status: PlayerStatus) {
-        guard sessions[id] != nil else { return }
+    private func follow(_ session: PlayerSession, as id: String) {
+        Task { [weak self] in
+            for await status in session.updates { await self?.update(id, status, from: session) }
+            await self?.ended(id, session)
+        }
+    }
+
+    private func update(_ id: String, _ status: PlayerStatus, from session: PlayerSession) {
+        guard sessions[id] === session else { return }
         statuses[id] = status
         publishPlayers()
+    }
+
+    /// A session ran out. A player that connected to us is gone until it connects again; one
+    /// we connect to stays listed with how it ended, for the operator to pair or use it.
+    private func ended(_ id: String, _ session: PlayerSession) {
+        guard sessions[id] === session else { return }
+        if dialed[id] == nil {
+            remove(id)
+        } else {
+            codeRequests.removeValue(forKey: id)?.resume(returning: nil)
+        }
+    }
+
+    // MARK: Players that announce themselves
+
+    private func localNetwork(denied: Bool) {
+        state.localNetworkDenied = denied
+    }
+
+    /// The players on the network changed: connect to the new ones, let go of those gone.
+    private func found(_ players: [DiscoveredPlayer]) async {
+        guard state.running else { return }
+        let wanted = Dictionary(players.map { ($0.instanceName, $0) }) { first, _ in first }
+        for id in dialed.keys where wanted[id] == nil {
+            dialed[id] = nil
+            if let session = sessions[id] { await group?.remove(url: session.url) }
+            remove(id)
+        }
+        for (id, player) in wanted {
+            if let known = dialed[id] {
+                // A machine with two addresses is found at either. Only a player we can't
+                // reach is tried at the other one: a connection that works is kept.
+                guard known.url != player.url, statuses[id]?.connection == .unavailable else { continue }
+                Log.info("\(player.displayName ?? id) moved to \(player.url.absoluteString)")
+            } else {
+                Log.info("Found \(player.displayName ?? id) at \(player.url.absoluteString)")
+            }
+            dialed[id] = player
+            await dial(id)
+        }
+    }
+
+    /// Connect to a found player, in place of any session with it that ran before. `chosen`
+    /// claims it for playback, which only the operator asking for it does.
+    private func dial(_ id: String, chosen: Bool = false, pairing: PairingRequest? = nil) async {
+        guard let player = dialed[id], let group, let identity, let pairings, let store else { return }
+        if let earlier = sessions[id] { await group.remove(url: earlier.url) }
+        guard dialed[id] == player, self.group === group else { return }
+        let session = PlayerSession(url: player.url, identity: identity, pairings: pairings, chosen: chosen,
+                                    pairing: pairing) { clientID, paired in
+            paired || store.isAllowed(clientID)
+        }
+        sessions[id] = session
+        if statuses[id] == nil { statuses[id] = PlayerStatus() }
+        publishPlayers()
+        follow(session, as: id)
+        await group.add(session)
+    }
+
+    /// Take a found player back for this server: one another server took, or that left.
+    public func use(_ id: String) async {
+        await dial(id, chosen: true)
     }
 
     private func remove(_ id: String) {
@@ -175,21 +268,28 @@ public actor StandaloneServer {
 
     private func publishPlayers() {
         state.players = statuses.compactMap { id, status in
-            // Not listed before it said who it is.
-            guard let name = status.name else { return nil }
+            // Not listed before it said who it is, unless its announcement named it. Nor is a
+            // device that turned out to be no speaker.
+            let announced = dialed[id].map { $0.displayName ?? $0.instanceName }
+            guard let name = status.name ?? announced, status.connection != .failed("not a speaker") else { return nil }
             return Player(id: id, clientID: status.clientID, name: name, connection: status.connection,
                           paired: status.paired, pairing: status.pairing,
-                          offersCode: status.pairMethods?.dynamicCode != nil)
+                          offersCode: status.pairMethods?.dynamicCode != nil, found: dialed[id] != nil)
         }.sorted { ($0.name.lowercased(), $0.id) < ($1.name.lowercased(), $1.id) }
     }
 
     /// Start pairing with the six digits the player shows; `enterCode(_:for:)` supplies them
     /// once `Player.pairing` asks.
     public func pair(_ id: String) async {
-        guard let session = sessions[id] else { return }
-        await session.pair(PairingRequest(method: .dynamicCode) { [weak self] _ in
+        let request = PairingRequest(method: .dynamicCode) { [weak self] _ in
             await self?.awaitCode(for: id)
-        })
+        }
+        // A found player's session ended when it asked for pairing: a new one pairs.
+        if dialed[id] != nil {
+            await dial(id, chosen: true, pairing: request)
+        } else {
+            await sessions[id]?.pair(request)
+        }
     }
 
     private func awaitCode(for id: String) async -> String? {
@@ -211,7 +311,11 @@ public actor StandaloneServer {
     public func allow(_ id: String) async {
         guard let clientID = statuses[id]?.clientID else { return }
         store?.setAllowed(clientID, true)
-        await sessions[id]?.reevaluateApproval()
+        if dialed[id] != nil {
+            await dial(id, chosen: true)
+        } else {
+            await sessions[id]?.reevaluateApproval()
+        }
     }
 
     /// Forget a player's pairing, and its permission to play without one.

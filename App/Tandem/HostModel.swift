@@ -96,6 +96,11 @@ final class HostModel {
         Task { await server?.allow(player.id) }
     }
 
+    /// Take back a speaker another server had.
+    func use(_ player: StandaloneServer.Player) {
+        Task { await server?.use(player.id) }
+    }
+
     func forget(_ player: StandaloneServer.Player) {
         Task { await server?.forget(player.id) }
     }
