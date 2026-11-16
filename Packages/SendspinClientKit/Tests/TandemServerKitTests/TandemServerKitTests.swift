@@ -139,7 +139,8 @@ final class MusicFolder {
         let group = PlaybackGroup(name: "Test", leadMs: 500)
         let store = try ServerStore(directory: folder.url.appendingPathComponent(".server"))
         return ServerAPI(name: "Test", serverID: "id", library: library, engine: PlaybackEngine(group: group),
-                         group: group, store: store)
+                         group: group, store: store,
+                         speakers: AirPlaySpeakers(group: group, store: store) { _ in })
     }
 
     private func call(_ api: ServerAPI, _ command: String, _ arguments: [String: Any] = [:]) async throws -> Data {

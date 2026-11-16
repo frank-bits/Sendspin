@@ -44,6 +44,8 @@ public actor StandaloneServer {
     public struct State: Sendable, Equatable {
         public var running = false
         public var players: [Player] = []
+        /// The AirPlay speakers on the network, and those switched on that aren't.
+        public var speakers: [AirPlaySpeakers.Speaker] = []
         public var library = Library.Status.noFolder
         public var apiPort: Int?
         /// The system refuses the server Local Network access, so it finds no players.
@@ -68,6 +70,7 @@ public actor StandaloneServer {
     private var group: PlaybackGroup?
     private var library: MusicLibrary?
     private var api: ServerAPI?
+    private var airPlay: AirPlaySpeakers?
     private var http: HTTPServer?
     private var listener: ServiceListener?
     private var accepting: Task<Void, Never>?
@@ -100,8 +103,11 @@ public actor StandaloneServer {
             let group = PlaybackGroup(name: configuration.name, leadMs: PlaybackEngine.minimumLeadMs)
             let engine = PlaybackEngine(group: group)
             let library = MusicLibrary(cacheURL: store.libraryCache)
+            let airPlay = AirPlaySpeakers(group: group, store: store) { [weak self] speakers in
+                Task { await self?.speakersChanged(speakers) }
+            }
             let api = ServerAPI(name: configuration.name, serverID: identity.id, library: library, engine: engine,
-                                group: group, store: store)
+                                group: group, store: store, speakers: airPlay)
             let http = HTTPServer { await api.respond(to: $0) }
             let port = try await http.start(port: configuration.apiPort)
             await engine.attach(artworkURL: { track in
@@ -120,7 +126,8 @@ public actor StandaloneServer {
                 Task { await self?.libraryChanged(status) }
             }
             (self.store, self.group, self.library, self.api, self.http, self.listener) = (store, group, library, api, http, listener)
-            (self.identity, self.pairings) = (identity, pairings)
+            (self.identity, self.pairings, self.airPlay) = (identity, pairings, airPlay)
+            await airPlay.start()
             PlayerBrowser.allowsLoopback = configuration.dialsLoopback
             let denied: @Sendable (Bool) -> Void = { [weak self] denied in
                 Task { await self?.localNetwork(denied: denied) }
@@ -150,10 +157,11 @@ public actor StandaloneServer {
         for request in codeRequests.values { request.resume(returning: nil) }
         codeRequests = [:]
         await api?.engine.stop()
+        await airPlay?.stop()
         await group?.shutdown()
         await library?.load(folder: nil)
         (store, group, library, api, http, listener) = (nil, nil, nil, nil, nil, nil)
-        (identity, pairings, dialed) = (nil, nil, [:])
+        (identity, pairings, dialed, airPlay) = (nil, nil, [:], nil)
         sessions = [:]
         statuses = [:]
         state = State()
@@ -167,6 +175,22 @@ public actor StandaloneServer {
 
     private func libraryChanged(_ status: Library.Status) {
         state.library = status
+    }
+
+    // MARK: AirPlay speakers
+
+    private func speakersChanged(_ speakers: [AirPlaySpeakers.Speaker]) {
+        guard state.running else { return }
+        state.speakers = speakers
+    }
+
+    /// Have an AirPlay speaker play with the group, or not.
+    public func setSpeaker(_ id: String, enabled: Bool) async {
+        await airPlay?.setEnabled(id, enabled)
+    }
+
+    public func setSpeaker(_ id: String, volume: Int) async {
+        await airPlay?.setVolume(id, volume)
     }
 
     // MARK: Players

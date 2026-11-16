@@ -96,6 +96,16 @@ final class HostModel {
         Task { await server?.allow(player.id) }
     }
 
+    // MARK: AirPlay speakers
+
+    func setSpeaker(_ speaker: AirPlaySpeakers.Speaker, enabled: Bool) {
+        Task { await server?.setSpeaker(speaker.id, enabled: enabled) }
+    }
+
+    func setSpeaker(_ speaker: AirPlaySpeakers.Speaker, volume: Int) {
+        Task { await server?.setSpeaker(speaker.id, volume: volume) }
+    }
+
     /// Take back a speaker another server had.
     func use(_ player: StandaloneServer.Player) {
         Task { await server?.use(player.id) }

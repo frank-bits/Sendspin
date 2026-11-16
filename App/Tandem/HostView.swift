@@ -30,6 +30,7 @@ struct HostView: View {
                 if host.isEnabled {
                     music
                     players
+                    speakers
                 }
             }
             .formStyle(.grouped)
@@ -80,6 +81,59 @@ struct HostView: View {
             Text("Players")
         } footer: {
             Text("A player is paired once, with a code it shows, and plays whenever it's connected after that.")
+        }
+    }
+}
+
+private extension HostView {
+    var speakers: some View {
+        Section {
+            if host.state.speakers.isEmpty {
+                Text("No AirPlay speakers found on this network.").foregroundStyle(.secondary)
+            }
+            ForEach(host.state.speakers) { SpeakerRow(speaker: $0, host: host) }
+        } header: {
+            Text("AirPlay Speakers")
+        } footer: {
+            Text("A speaker that's switched on is taken over when music starts, and let go soon after it stops. "
+                + "With one switched on, music starts about two seconds after you ask: that's how far ahead "
+                + "AirPlay speakers buffer. Apple TV, HomePod and Macs aren't listed; they need Apple's own AirPlay.")
+        }
+    }
+}
+
+/// One AirPlay speaker: whether it plays with the group, and how loud.
+private struct SpeakerRow: View {
+    let speaker: AirPlaySpeakers.Speaker
+    let host: HostModel
+
+    var body: some View {
+        HStack {
+            Toggle(isOn: Binding(get: { speaker.enabled }, set: { host.setSpeaker(speaker, enabled: $0) })) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(speaker.name)
+                    if let detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
+                }
+            }
+            if speaker.enabled {
+                Stepper("\(speaker.volume)", value: Binding(get: { speaker.volume },
+                                                           set: { host.setSpeaker(speaker, volume: $0) }),
+                        in: 0...100, step: 5)
+                    .monospacedDigit()
+                    .fixedSize()
+                    .help("Volume")
+            }
+        }
+    }
+
+    private var detail: String? {
+        guard speaker.enabled else { return speaker.model }
+        if !speaker.present { return "Not on the network" }
+        switch speaker.status {
+        case .idle: return speaker.model
+        case .connecting: return "Connecting…"
+        case .playing: return "Playing"
+        case .failed(let reason): return "Couldn't play: \(reason)"
         }
     }
 }

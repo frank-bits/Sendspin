@@ -9,6 +9,7 @@ public final class ServerStore: @unchecked Sendable {
     private let lock = NSLock()
     private var allowed: Set<String>
     private var recent: [String]
+    private var airPlay: [String: AirPlaySetting]
 
     private static let recentLimit = 24
 
@@ -18,6 +19,7 @@ public final class ServerStore: @unchecked Sendable {
                                                 attributes: [.posixPermissions: 0o700])
         allowed = Set(Self.read([String].self, directory.appendingPathComponent("allowed.json")) ?? [])
         recent = Self.read([String].self, directory.appendingPathComponent("recent.json")) ?? []
+        airPlay = Self.read([String: AirPlaySetting].self, directory.appendingPathComponent("airplay.json")) ?? [:]
     }
 
     var libraryCache: URL { directory.appendingPathComponent("library.json") }
@@ -72,6 +74,28 @@ public final class ServerStore: @unchecked Sendable {
             return recent
         }
         save(ids, "recent.json")
+    }
+
+    // MARK: AirPlay speakers
+
+    /// What's remembered of an AirPlay speaker, by its hardware address.
+    public struct AirPlaySetting: Codable, Sendable, Equatable {
+        /// A speaker starts quiet: its first sound shouldn't startle.
+        static let startVolume = 25
+
+        var enabled = false
+        var volume = AirPlaySetting.startVolume
+        var muted = false
+        /// Its name when last seen, to list it while it's off the network.
+        var name: String
+    }
+
+    var airPlaySettings: [String: AirPlaySetting] {
+        get { lock.withLock { airPlay } }
+        set {
+            lock.withLock { airPlay = newValue }
+            save(newValue, "airplay.json")
+        }
     }
 
     // MARK: Files

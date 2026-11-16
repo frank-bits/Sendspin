@@ -19,6 +19,7 @@ struct ServerAPI: Sendable {
     let engine: PlaybackEngine
     let group: PlaybackGroup
     let store: ServerStore
+    let speakers: AirPlaySpeakers
     let artwork = ArtworkCache()
 
     func respond(to request: HTTPRequest) async -> HTTPResponse {
@@ -92,14 +93,18 @@ struct ServerAPI: Sendable {
             return await players().first { $0["player_id"] as? String == id } ?? NSNull()
         case "players/cmd/volume_set", "players/cmd/group_volume":
             guard let level = arguments.int("volume_level") else { return NSNull() }
-            if let session = await session(arguments.string("player_id")) {
+            if let speaker = speakerID(arguments.string("player_id")) {
+                await speakers.setVolume(speaker, level)
+            } else if let session = await session(arguments.string("player_id")) {
                 await session.setVolume(level)
             } else {
                 await group.setVolume(level)
             }
         case "players/cmd/volume_mute", "players/cmd/group_volume_mute":
             guard let muted = arguments.bool("muted") else { return NSNull() }
-            if let session = await session(arguments.string("player_id")) {
+            if let speaker = speakerID(arguments.string("player_id")) {
+                await speakers.setMuted(speaker, muted)
+            } else if let session = await session(arguments.string("player_id")) {
                 await session.setMuted(muted)
             } else {
                 await group.setMuted(muted)
@@ -178,7 +183,21 @@ struct ServerAPI: Sendable {
             if inGroup { player["active_group"] = Self.groupID }
             list.append(player)
         }
+        for speaker in await speakers.speakers where speaker.enabled {
+            list.append([
+                "player_id": AirPlaySpeakers.memberID(speaker.id), "name": speaker.name, "display_name": speaker.name,
+                "type": "player", "available": speaker.present, "enabled": true, "hide_in_ui": true,
+                "playback_state": speaker.status == .playing ? "playing" : "idle", "volume_level": speaker.volume,
+                "volume_muted": speaker.muted, "active_group": Self.groupID,
+            ])
+        }
         return list
+    }
+
+    /// The AirPlay speaker a player id names, if it names one.
+    private func speakerID(_ id: String?) -> String? {
+        guard let id, id.hasPrefix("airplay:") else { return nil }
+        return String(id.dropFirst("airplay:".count))
     }
 
     /// The connected player with this client id; nil for the group or an unknown id.

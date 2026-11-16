@@ -16,6 +16,9 @@ Then, on standard input:
   allow <n>          let player n play without pairing, if it admits that
   forget <n>         forget player n's pairing
   use <n>            take player n back, after another server had it
+  speakers           list the AirPlay speakers
+  speaker <n> on|off have AirPlay speaker n play with the group, or not
+  speaker <n> <0-100> set AirPlay speaker n's volume
   rescan             read the music folder again
   quit
 """
@@ -93,6 +96,20 @@ func enter(_ code: String, for player: StandaloneServer.Player) async {
     await server.enterCode(code.filter(\.isNumber), for: player.id)
 }
 
+func describe(_ speaker: AirPlaySpeakers.Speaker) -> String {
+    var text = "\(speaker.name)\(speaker.model.map { " (\($0))" } ?? ""): \(speaker.enabled ? "on" : "off")"
+    guard speaker.enabled else { return text }
+    text += ", volume \(speaker.volume)"
+    if !speaker.present { return text + ", not on the network" }
+    switch speaker.status {
+    case .idle: break
+    case .connecting: text += ", connecting"
+    case .playing: text += ", playing"
+    case .failed(let reason): text += ", failed: \(reason)"
+    }
+    return text
+}
+
 await server.start()
 let started = await server.currentState
 if let error = started.error {
@@ -115,8 +132,27 @@ Task {
             for (index, player) in state.players.enumerated() { print("  \(index + 1). \(describe(player))") }
             if state.players.isEmpty { print("  No players connected.") }
         }
+        if state.speakers.filter(\.enabled) != last.speakers.filter(\.enabled) {
+            for speaker in state.speakers where speaker.enabled { print("  AirPlay: \(describe(speaker))") }
+        }
         last = state
     }
+}
+
+// Asked to end, as a service manager or Ctrl-C does: let the speakers go first, or they
+// keep waiting for audio.
+signal(SIGTERM, SIG_IGN)
+signal(SIGINT, SIG_IGN)
+let signals = [SIGTERM, SIGINT].map { number in
+    let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+    source.setEventHandler {
+        Task {
+            await server.stop()
+            exit(0)
+        }
+    }
+    source.resume()
+    return source
 }
 
 for try await line in FileHandle.standardInput.bytes.lines {
@@ -137,6 +173,24 @@ for try await line in FileHandle.standardInput.bytes.lines {
         await server.forget(player.id)
     case ("use", let player?):
         await server.use(player.id)
+    case ("speakers", _):
+        let speakers = await server.currentState.speakers
+        for (index, speaker) in speakers.enumerated() { print("  \(index + 1). \(describe(speaker))") }
+        if speakers.isEmpty { print("  No AirPlay speakers found.") }
+    case ("speaker", _) where words.count == 3:
+        let speakers = await server.currentState.speakers
+        guard let number = Int(words[1]), speakers.indices.contains(number - 1) else {
+            print("No such speaker; 'speakers' lists them.")
+            break
+        }
+        let speaker = speakers[number - 1]
+        if let volume = Int(words[2]) {
+            await server.setSpeaker(speaker.id, volume: volume)
+        } else if ["on", "off"].contains(words[2]) {
+            await server.setSpeaker(speaker.id, enabled: words[2] == "on")
+        } else {
+            print("Say on, off or a volume from 0 to 100.")
+        }
     case ("rescan", _):
         await server.setMusicFolder(musicFolder)
     case ("quit", _), ("exit", _):

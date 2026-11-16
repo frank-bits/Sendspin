@@ -168,7 +168,7 @@ final class HTTPServer: @unchecked Sendable {
 }
 
 /// Resumes a continuation once, whichever of several callbacks comes first.
-private final class Once: @unchecked Sendable {
+final class Once: @unchecked Sendable {
     private let lock = NSLock()
     private var claimed = false
 
