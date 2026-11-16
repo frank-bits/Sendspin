@@ -16,7 +16,14 @@ actor AirPlayStream {
         case audio(PCMBuffer, playUs: Int64)
         /// The group stopped, or jumps elsewhere: drop what the speaker holds.
         case stop
+        /// What plays changed.
+        case details(title: String?, artist: String?, album: String?)
     }
+
+    /// What plays, as the speaker was last to be told.
+    private var details: (title: String?, artist: String?, album: String?) = (nil, nil, nil)
+    /// The list last sent over this connection, not to send it twice.
+    private var sentDetails: Data?
 
     /// How long a speaker is left alone after it failed, before the next try.
     private static let retryUs: Int64 = 10_000_000
@@ -71,6 +78,9 @@ actor AirPlayStream {
         switch event {
         case .audio(let pcm, let playUs): await play(pcm, at: playUs)
         case .stop: await flush()
+        case .details(let title, let artist, let album):
+            details = (title, artist, album)
+            if let link { try? await sendDetails(over: link) }
         }
     }
 
@@ -287,6 +297,8 @@ actor AirPlayStream {
                             audioAddress: audioAddress, controlAddress: controlAddress,
                             receiverLatency: min(max(0, latency), RAOP.latencyFrames))
             try await sendVolume(over: link)
+            sentDetails = nil
+            try await sendDetails(over: link)
             self.link = link
             anchor = nil
             firstPacket = true
@@ -311,6 +323,18 @@ actor AirPlayStream {
     private func sendVolume(over link: Link) async throws {
         let text = String(format: "volume: %.6f\r\n", RAOP.decibels(volume: volume, muted: muted))
         _ = try await link.rtsp.send("SET_PARAMETER", link.uri, body: Data(text.utf8), contentType: "text/parameters")
+    }
+
+    /// Tell the speaker what plays. Without a title yet it gets the app's name: a Sonos
+    /// speaker takes the audio and stays silent until it has been told something.
+    private func sendDetails(over link: Link) async throws {
+        let title = details.title.flatMap { $0.isEmpty ? nil : $0 } ?? "Tandem"
+        let list = RAOP.trackDetails(title: title, artist: details.artist, album: details.album)
+        guard list != sentDetails else { return }
+        sentDetails = list
+        _ = try await link.rtsp.send("SET_PARAMETER", link.uri,
+                                     headers: [("RTP-Info", "rtptime=\(UInt32(truncatingIfNeeded: nextFrame))")],
+                                     body: list, contentType: "application/x-dmap-tagged", lenient: true)
     }
 
     private func disconnect() async {
@@ -413,6 +437,10 @@ final class AirPlayOutput: GroupOutput {
 
     func stop() {
         events.yield(.stop)
+    }
+
+    func describe(title: String?, artist: String?, album: String?) {
+        events.yield(.details(title: title, artist: artist, album: album))
     }
 
     /// The speaker left the group: let it go, and wait until it's told.

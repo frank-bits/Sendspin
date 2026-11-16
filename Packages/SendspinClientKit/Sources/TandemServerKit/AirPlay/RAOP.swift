@@ -68,6 +68,22 @@ enum RAOP {
         return reply
     }
 
+    /// What plays, as the tagged list AirPlay carries it in. A Sonos speaker plays nothing
+    /// until it has been sent one, so there is always a title.
+    static func trackDetails(title: String, artist: String?, album: String?) -> Data {
+        // The kind of item (a song), then the texts.
+        var items = Data("mikd".utf8) + Data([0, 0, 0, 1, 2])
+        for (tag, text) in [("minm", title), ("asar", artist ?? ""), ("asal", album ?? "")] {
+            let bytes = Data(text.utf8.prefix(240))
+            items.append(Data(tag.utf8))
+            items.append(bigEndian: UInt32(bytes.count))
+            items.append(bytes)
+        }
+        var list = Data("mlit".utf8)
+        list.append(bigEndian: UInt32(items.count))
+        return list + items
+    }
+
     /// The packets a receiver missed and asks for again; nil for anything else.
     static func resendRequest(_ packet: Data) -> (first: UInt16, count: Int)? {
         let packet = Data(packet)

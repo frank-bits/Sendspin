@@ -47,6 +47,18 @@ import Testing
         #expect(RAOP.timingReply(to: Data([0x80, 0xD4]) + Data(count: 30), nowMicros: 0) == nil)
     }
 
+    @Test func trackDetailsAreATaggedListWithItsLength() {
+        let list = RAOP.trackDetails(title: "Song", artist: "Zed", album: nil)
+        #expect(Array(list.prefix(4)) == Array("mlit".utf8))
+        #expect(Int(list[4]) << 24 | Int(list[5]) << 16 | Int(list[6]) << 8 | Int(list[7]) == list.count - 8)
+        // A song, then its title, artist and an empty album.
+        var items: [UInt8] = Array("mikd".utf8) + [0, 0, 0, 1, 2]
+        items += Array("minm".utf8) + [0, 0, 0, 4] + Array("Song".utf8)
+        items += Array("asar".utf8) + [0, 0, 0, 3] + Array("Zed".utf8)
+        items += Array("asal".utf8) + [0, 0, 0, 0]
+        #expect(Array(list.dropFirst(8)) == items)
+    }
+
     @Test func resendRequestsNameTheFirstPacketAndHowMany() throws {
         let request = try #require(RAOP.resendRequest(Data([0x80, 0xD5, 0, 1, 0x12, 0x34, 0, 3])))
         #expect(request.first == 0x1234)

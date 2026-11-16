@@ -7,6 +7,12 @@ public protocol GroupOutput: AnyObject, Sendable {
     func play(_ pcm: PCMBuffer, timestampUs: Int64)
     /// The group stopped (idle, or its lead changed): drop what's queued.
     func stop()
+    /// What plays changed, for an output that shows it.
+    func describe(title: String?, artist: String?, album: String?)
+}
+
+public extension GroupOutput {
+    func describe(title: String?, artist: String?, album: String?) {}
 }
 
 /// A member of the group that isn't a Sendspin player, such as this Mac's own speakers: a
@@ -161,6 +167,7 @@ public actor PlaybackGroup {
     public func setMetadata(_ state: MetadataState) async {
         trackDetails = state
         for (session, _) in sessions.values { await session.updateMetadata(state) }
+        for output in outputs.values { output.describe(title: state.title, artist: state.artist, album: state.album) }
     }
 
     /// A seek or a jump to another track: players drop what they have buffered, and the
@@ -299,6 +306,9 @@ public actor PlaybackGroup {
     public func add(output: any GroupOutput, leadMs: Int = 0) {
         outputs[ObjectIdentifier(output)] = output
         outputLeads[ObjectIdentifier(output)] = leadMs
+        if let trackDetails {
+            output.describe(title: trackDetails.title, artist: trackDetails.artist, album: trackDetails.album)
+        }
     }
 
     public func remove(output: any GroupOutput) {
