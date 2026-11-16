@@ -8,7 +8,7 @@ import SendspinClientKit
 struct Probe {
     static let usage = """
         usage: sendspin-probe [--url ws://host:port/path | --listen] [--name NAME] [--seconds N]
-                              [--state FILE] [--show-token] [--verbose]
+                              [--state FILE] [--play | --discard] [--show-token] [--verbose]
 
           --url         connect here instead of discovering a server over mDNS
           --listen      announce this client and wait for servers to connect, as hardware speakers do
@@ -16,6 +16,7 @@ struct Probe {
           --seconds     how long to stay connected (default 20; use more to pair)
           --state       credentials file (default: ~/Library/Application Support/sendspin-probe/credentials.json)
           --play        play the server's audio on this Mac's output (otherwise the probe reports itself unavailable)
+          --discard     take the server's audio as a player would, and throw it away
           --show-token  print the pairing token: a credential that lets any server pair with this client
           --verbose     debug logging
         """
@@ -30,6 +31,7 @@ struct Probe {
         var showToken = false
         var play = false
         var listen = false
+        var discard = false
         var arguments = CommandLine.arguments.dropFirst().makeIterator()
         while let argument = arguments.next() {
             switch argument {
@@ -40,6 +42,7 @@ struct Probe {
             case "--show-token": showToken = true
             case "--play": play = true
             case "--listen": listen = true
+            case "--discard": discard = true
             case "--verbose": Log.minimumLevel = .debug
             default:
                 print(usage)
@@ -67,7 +70,7 @@ struct Probe {
             name: name, productName: "sendspin-probe", manufacturer: "SendspinClientKit", softwareVersion: "0.0.1",
             supportedRoles: ["player@v1", "controller@v1", "metadata@v1"], playerSupport: PlayerEngine.support())
         // Without --play the probe can't output audio, so it isn't available for playback.
-        let status = ClientStatus(available: play, player: PlayerEngine.state(volume: 100, muted: false))
+        let status = ClientStatus(available: play || discard, player: PlayerEngine.state(volume: 100, muted: false))
 
         if listen {
             let listener = ServiceListener(name: name, kind: .client)

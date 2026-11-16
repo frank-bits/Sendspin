@@ -40,7 +40,7 @@ public actor PlaybackGroup {
     public static let sendMarginMs = 50
 
     public nonisolated let id = GroupID.random()
-    public let name: String
+    public nonisolated let name: String
     /// How far ahead of capture time players are told to play (their buffer).
     public private(set) var leadUs: Int64
     /// Bit depth to stream when players support it (16 or 24).
@@ -101,14 +101,46 @@ public actor PlaybackGroup {
         await session.join(groupID: id, groupName: name, group: self)
         await session.setPlaying(playing)
         if let trackDetails { await session.updateMetadata(trackDetails) }
-        sessions[session.url] = (session, Task { [weak self] in
+        sessions[session.url] = (session, Task {
             await session.run()
             // A player that connected to us is served once: it comes back as a new session.
-            if session.isIncoming { await self?.ended(session) }
+            // The group it's in by then may be another than the one it was added to.
+            if session.isIncoming { await session.currentGroup?.ended(session) }
         })
     }
 
-    private func ended(_ session: PlayerSession) async {
+    /// A player on its way from one group to another, its connection kept.
+    public struct Membership: Sendable {
+        public let session: PlayerSession
+        let task: Task<Void, Never>
+    }
+
+    /// Let a player go without ending its connection, for another group to `adopt`.
+    public func release(url: URL) async -> Membership? {
+        guard let entry = sessions.removeValue(forKey: url) else { return nil }
+        await entry.session.setPlaying(false)
+        await membersChanged()
+        return Membership(session: entry.session, task: entry.task)
+    }
+
+    /// Take in a player another group released: it plays what this group plays from the next block.
+    public func adopt(_ membership: Membership) async {
+        let session = membership.session
+        guard sessions[session.url] == nil else { return }
+        sessions[session.url] = (session, membership.task)
+        await session.join(groupID: id, groupName: name, group: self)
+        await session.setPlaying(playing)
+        await session.updateMetadata(trackDetails ?? MetadataState(timestamp: ServerClock.nowMicros()))
+        await membersChanged()
+    }
+
+    /// Nobody would hear the group: no player takes part, and it has no other output.
+    public func hasListeners() async -> Bool {
+        if !outputs.isEmpty { return true }
+        return !(await groupMembers().isEmpty)
+    }
+
+    func ended(_ session: PlayerSession) async {
         guard sessions[session.url]?.session === session else { return }
         sessions[session.url] = nil
         await membersChanged()

@@ -46,6 +46,8 @@ public actor StandaloneServer {
         public var players: [Player] = []
         /// The AirPlay speakers on the network, and those switched on that aren't.
         public var speakers: [AirPlaySpeakers.Speaker] = []
+        /// The groups of speakers the user made; "Everywhere" isn't listed, it's always there.
+        public var groups: [ServerStore.SyncGroup] = []
         public var library = Library.Status.noFolder
         public var apiPort: Int?
         /// The system refuses the server Local Network access, so it finds no players.
@@ -67,7 +69,9 @@ public actor StandaloneServer {
 
     private let configuration: Configuration
     private var store: ServerStore?
+    /// Everywhere's group: where players and speakers are until another group calls them in.
     private var group: PlaybackGroup?
+    private var zones: Zones?
     private var library: MusicLibrary?
     private var api: ServerAPI?
     private var airPlay: AirPlaySpeakers?
@@ -100,21 +104,21 @@ public actor StandaloneServer {
             let store = try ServerStore(directory: configuration.dataDirectory)
             let identity = try store.identity(name: configuration.name)
             let pairings = store.pairings()
-            let group = PlaybackGroup(name: configuration.name, leadMs: PlaybackEngine.minimumLeadMs)
-            let engine = PlaybackEngine(group: group)
+            let group = PlaybackGroup(name: Zones.everywhereName, leadMs: PlaybackEngine.minimumLeadMs)
             let library = MusicLibrary(cacheURL: store.libraryCache)
             let airPlay = AirPlaySpeakers(group: group, store: store) { [weak self] speakers in
                 Task { await self?.speakersChanged(speakers) }
             }
-            let api = ServerAPI(name: configuration.name, serverID: identity.id, library: library, engine: engine,
-                                group: group, store: store, speakers: airPlay)
+            let zones = Zones(home: group, store: store, speakers: airPlay) { [weak self] groups in
+                Task { await self?.groupsChanged(groups) }
+            }
+            let api = ServerAPI(name: configuration.name, serverID: identity.id, library: library, zones: zones,
+                                store: store, speakers: airPlay)
             let http = HTTPServer { await api.respond(to: $0) }
             let port = try await http.start(port: configuration.apiPort)
-            await engine.attach(artworkURL: { track in
+            await zones.start { track in
                 LocalAddress.primaryIPv4().map { "http://\($0):\(port)/imageproxy/\(track.albumID)?size=512" }
-            }, onTrackStarted: { track in
-                store.played(albumID: track.albumID)
-            })
+            }
             let listener = ServiceListener(name: configuration.name, kind: .server, txt: [Self.apiPortKey: "\(port)"])
             listener.start()
             accepting = Task { [weak self] in
@@ -126,7 +130,8 @@ public actor StandaloneServer {
                 Task { await self?.libraryChanged(status) }
             }
             (self.store, self.group, self.library, self.api, self.http, self.listener) = (store, group, library, api, http, listener)
-            (self.identity, self.pairings, self.airPlay) = (identity, pairings, airPlay)
+            (self.identity, self.pairings, self.airPlay, self.zones) = (identity, pairings, airPlay, zones)
+            state.groups = await zones.groups
             await airPlay.start()
             PlayerBrowser.allowsLoopback = configuration.dialsLoopback
             let denied: @Sendable (Bool) -> Void = { [weak self] denied in
@@ -156,12 +161,11 @@ public actor StandaloneServer {
         http?.stop()
         for request in codeRequests.values { request.resume(returning: nil) }
         codeRequests = [:]
-        await api?.engine.stop()
         await airPlay?.stop()
-        await group?.shutdown()
+        await zones?.stop()
         await library?.load(folder: nil)
         (store, group, library, api, http, listener) = (nil, nil, nil, nil, nil, nil)
-        (identity, pairings, dialed, airPlay) = (nil, nil, [:], nil)
+        (identity, pairings, dialed, airPlay, zones) = (nil, nil, [:], nil, nil)
         sessions = [:]
         statuses = [:]
         state = State()
@@ -182,6 +186,37 @@ public actor StandaloneServer {
     private func speakersChanged(_ speakers: [AirPlaySpeakers.Speaker]) {
         guard state.running else { return }
         state.speakers = speakers
+    }
+
+    // MARK: Groups of speakers
+
+    private func groupsChanged(_ groups: [ServerStore.SyncGroup]) {
+        guard state.running else { return }
+        state.groups = groups
+    }
+
+    /// Make a group; speakers are put in it with `setGroup(_:member:included:)`.
+    public func addGroup(name: String) async {
+        let name = name.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        await zones?.addGroup(name: name)
+    }
+
+    public func deleteGroup(_ id: String) async {
+        await zones?.deleteGroup(id)
+    }
+
+    /// Put a speaker in a group, or take it out. A Sendspin player goes by its client id, an
+    /// AirPlay speaker by `AirPlaySpeakers.memberID`.
+    public func setGroup(_ id: String, member: ServerStore.SyncGroup.Member, included: Bool) async {
+        await zones?.setMember(member, in: id, included: included)
+    }
+
+    /// The groups that play now, Everywhere among them, by id.
+    public func playingGroups() async -> Set<String> {
+        var playing: Set<String> = []
+        for zone in await zones?.all ?? [] where await zone.engine.snapshot().state == .playing { playing.insert(zone.id) }
+        return playing
     }
 
     /// Have an AirPlay speaker play with the group, or not.
@@ -215,15 +250,18 @@ public actor StandaloneServer {
         }
     }
 
-    private func update(_ id: String, _ status: PlayerStatus, from session: PlayerSession) {
+    private func update(_ id: String, _ status: PlayerStatus, from session: PlayerSession) async {
         guard sessions[id] === session else { return }
         statuses[id] = status
         publishPlayers()
+        // Now that it's known who it is: back to the group it last played with.
+        if let clientID = status.clientID { await zones?.place(session, clientID: clientID) }
     }
 
     /// A session ran out. A player that connected to us is gone until it connects again; one
     /// we connect to stays listed with how it ended, for the operator to pair or use it.
-    private func ended(_ id: String, _ session: PlayerSession) {
+    private func ended(_ id: String, _ session: PlayerSession) async {
+        await zones?.gone(session)
         guard sessions[id] === session else { return }
         if dialed[id] == nil {
             remove(id)
@@ -244,7 +282,7 @@ public actor StandaloneServer {
         let wanted = Dictionary(players.map { ($0.instanceName, $0) }) { first, _ in first }
         for id in dialed.keys where wanted[id] == nil {
             dialed[id] = nil
-            if let session = sessions[id] { await group?.remove(url: session.url) }
+            if let session = sessions[id] { await zones?.drop(session) }
             remove(id)
         }
         for (id, player) in wanted {
@@ -265,7 +303,7 @@ public actor StandaloneServer {
     /// claims it for playback, which only the operator asking for it does.
     private func dial(_ id: String, chosen: Bool = false, pairing: PairingRequest? = nil) async {
         guard let player = dialed[id], let group, let identity, let pairings, let store else { return }
-        if let earlier = sessions[id] { await group.remove(url: earlier.url) }
+        if let earlier = sessions[id] { await zones?.drop(earlier) }
         guard dialed[id] == player, self.group === group else { return }
         let session = PlayerSession(url: player.url, identity: identity, pairings: pairings, chosen: chosen,
                                     pairing: pairing) { clientID, paired in

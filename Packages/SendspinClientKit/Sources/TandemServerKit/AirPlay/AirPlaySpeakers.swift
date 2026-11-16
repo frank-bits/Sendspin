@@ -28,7 +28,10 @@ public actor AirPlaySpeakers {
     /// AirPlay buffers, and a little for the way there.
     static let leadMs = 2_100
 
-    private let group: PlaybackGroup
+    /// The group a speaker plays with unless another called it in.
+    private let home: PlaybackGroup
+    /// The group each speaker was last called in to.
+    private var groups: [String: PlaybackGroup] = [:]
     private let store: ServerStore
     private let onChange: @Sendable ([Speaker]) -> Void
     private var found: [String: AirPlaySpeaker] = [:]
@@ -38,7 +41,7 @@ public actor AirPlaySpeakers {
     private var browsing: Task<Void, Never>?
 
     init(group: PlaybackGroup, store: ServerStore, onChange: @escaping @Sendable ([Speaker]) -> Void) {
-        self.group = group
+        home = group
         self.store = store
         self.onChange = onChange
     }
@@ -99,7 +102,34 @@ public actor AirPlaySpeakers {
     private func apply(_ id: String) async {
         if let setting = settings[id] { await outputs[id]?.stream.setVolume(setting.volume, muted: setting.muted) }
         onChange(speakers)
-        await group.membersChanged()
+        await (groups[id] ?? home).membersChanged()
+    }
+
+    /// Have a speaker play with `group` from now on.
+    func move(_ id: String, to group: PlaybackGroup) async {
+        guard (groups[id] ?? home) !== group else { return }
+        await unhook(id)
+        groups[id] = group
+        await hook(id)
+    }
+
+    /// Put a speaker's output and its volume into its group.
+    private func hook(_ id: String) async {
+        guard let output = outputs[id] else { return }
+        let group = groups[id] ?? home
+        await group.add(output: output, leadMs: Self.leadMs)
+        // Its volume counts in the group's, and the group's volume moves it.
+        await group.setLocalMember(LocalMember(
+            state: { [weak self] in await self?.member(id) },
+            setVolume: { [weak self] in await self?.setVolume(id, $0) },
+            setMuted: { [weak self] in await self?.setMuted(id, $0) }), id: Self.memberID(id))
+    }
+
+    private func unhook(_ id: String) async {
+        guard let output = outputs[id] else { return }
+        let group = groups[id] ?? home
+        await group.remove(output: output)
+        await group.setLocalMember(nil, id: Self.memberID(id))
     }
 
     private func attach(_ id: String) async {
@@ -109,23 +139,18 @@ public actor AirPlaySpeakers {
             Task { await self?.statusChanged(id, status) }
         }
         outputs[id] = output
-        await group.add(output: output, leadMs: Self.leadMs)
-        // Its volume counts in the group's, and the group's volume moves it.
-        await group.setLocalMember(LocalMember(
-            state: { [weak self] in await self?.member(id) },
-            setVolume: { [weak self] in await self?.setVolume(id, $0) },
-            setMuted: { [weak self] in await self?.setMuted(id, $0) }), id: Self.memberID(id))
+        await hook(id)
     }
 
     private func detach(_ id: String) async {
-        guard let output = outputs.removeValue(forKey: id) else { return }
-        await group.remove(output: output)
+        guard let output = outputs[id] else { return }
+        await unhook(id)
+        outputs[id] = nil
         await output.shutdown()
         statuses[id] = nil
-        await group.setLocalMember(nil, id: Self.memberID(id))
     }
 
-    static func memberID(_ id: String) -> String { "airplay:\(id)" }
+    public static func memberID(_ id: String) -> String { "airplay:\(id)" }
 
     private func member(_ id: String) -> ControllerMember? {
         guard outputs[id] != nil, let setting = settings[id] else { return nil }

@@ -106,6 +106,26 @@ final class HostModel {
         Task { await server?.setSpeaker(speaker.id, volume: volume) }
     }
 
+    // MARK: Groups of speakers
+
+    /// The speakers that can be put in a group: connected players and switched-on AirPlay speakers.
+    var groupCandidates: [ServerStore.SyncGroup.Member] {
+        state.players.compactMap { player in player.clientID.map { .init(id: $0, name: player.name) } }
+            + state.speakers.filter(\.enabled).map { .init(id: AirPlaySpeakers.memberID($0.id), name: $0.name) }
+    }
+
+    func addGroup(named name: String) {
+        Task { await server?.addGroup(name: name) }
+    }
+
+    func deleteGroup(_ group: ServerStore.SyncGroup) {
+        Task { await server?.deleteGroup(group.id) }
+    }
+
+    func setGroup(_ group: ServerStore.SyncGroup, member: ServerStore.SyncGroup.Member, included: Bool) {
+        Task { await server?.setGroup(group.id, member: member, included: included) }
+    }
+
     /// Take back a speaker another server had.
     func use(_ player: StandaloneServer.Player) {
         Task { await server?.use(player.id) }

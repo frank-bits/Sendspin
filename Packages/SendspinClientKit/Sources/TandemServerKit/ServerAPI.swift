@@ -5,19 +5,16 @@ import SendspinClientKit
 ///
 /// It answers the part of Music Assistant's API that Tandem uses, in the same shapes
 /// (`POST /api` with a command and its arguments, `GET /imageproxy/<id>`), so one set of
-/// library screens serves both kinds of server. There is one queue, played by one group:
-/// whichever player or queue a command names, it means that one.
+/// library screens serves both kinds of server. Every group and every speaker has a queue of
+/// its own, named by its player id.
 ///
 /// Nothing signs in: anyone on the network can browse and play. Requests from web pages are
 /// refused, so a site open in a browser on the network can't drive it.
 struct ServerAPI: Sendable {
-    static let groupID = "group"
-
     let name: String
     let serverID: String
     let library: MusicLibrary
-    let engine: PlaybackEngine
-    let group: PlaybackGroup
+    let zones: Zones
     let store: ServerStore
     let speakers: AirPlaySpeakers
     let artwork = ArtworkCache()
@@ -89,43 +86,60 @@ struct ServerAPI: Sendable {
         case "players/all":
             return await players()
         case "players/get":
-            let id = arguments.string("player_id") ?? Self.groupID
+            let id = arguments.string("player_id") ?? Zones.everywhereID
             return await players().first { $0["player_id"] as? String == id } ?? NSNull()
         case "players/cmd/volume_set", "players/cmd/group_volume":
             guard let level = arguments.int("volume_level") else { return NSNull() }
-            if let speaker = speakerID(arguments.string("player_id")) {
+            let id = arguments.string("player_id")
+            if let speaker = speakerID(id) {
                 await speakers.setVolume(speaker, level)
-            } else if let session = await session(arguments.string("player_id")) {
+            } else if let id, let session = await zones.players[id] {
                 await session.setVolume(level)
             } else {
-                await group.setVolume(level)
+                await zones.zone(id)?.group.setVolume(level)
             }
         case "players/cmd/volume_mute", "players/cmd/group_volume_mute":
             guard let muted = arguments.bool("muted") else { return NSNull() }
-            if let speaker = speakerID(arguments.string("player_id")) {
+            let id = arguments.string("player_id")
+            if let speaker = speakerID(id) {
                 await speakers.setMuted(speaker, muted)
-            } else if let session = await session(arguments.string("player_id")) {
+            } else if let id, let session = await zones.players[id] {
                 await session.setMuted(muted)
             } else {
-                await group.setMuted(muted)
+                await zones.zone(id)?.group.setMuted(muted)
             }
 
-        // The queue.
-        case "player_queues/get":
-            return JSON.queue(await engine.snapshot())
-        case "player_queues/play_media":
-            await play(arguments)
-        case "player_queues/play_pause": await engine.togglePlayPause()
-        case "player_queues/play", "player_queues/resume": await engine.play()
-        case "player_queues/pause": await engine.pause()
-        case "player_queues/stop": await engine.stop()
-        case "player_queues/next": await engine.next()
-        case "player_queues/previous": await engine.previous()
-        case "player_queues/seek":
+        // The queue of the group or speaker a command names; Everywhere's when it names none.
+        case let queue where queue.hasPrefix("player_queues/"):
+            guard let zone = await zones.zone(arguments.string("queue_id")) else { return NSNull() }
+            return await run(String(queue.dropFirst("player_queues/".count)), arguments, on: zone)
+        default:
+            return nil
+        }
+        return NSNull()
+    }
+
+    private func run(_ command: String, _ arguments: Arguments, on zone: Zones.Zone) async -> Any? {
+        let engine = zone.engine
+        switch command {
+        case "get":
+            return JSON.queue(await engine.snapshot(), id: zone.id)
+        case "play_media":
+            await play(arguments, on: engine)
+        case "play_pause": await engine.togglePlayPause()
+        case "play", "resume":
+            await engine.play()
+            // Asked for while it plays already: speakers another group took come back.
+            await zones.gather(zone.id)
+        case "pause": await engine.pause()
+        case "stop": await engine.stop()
+        case "next": await engine.next()
+        case "previous": await engine.previous()
+        case "seek":
             if let position = arguments.double("position") { await engine.seek(to: position) }
-        case "player_queues/shuffle":
+        case "shuffle":
             if let on = arguments.bool("shuffle_enabled") { await engine.setShuffle(on) }
-        case "player_queues/repeat":
+        case "repeat":
             if let mode = arguments.string("repeat_mode") { await engine.setRepeat(mode) }
         default:
             return nil
@@ -133,7 +147,7 @@ struct ServerAPI: Sendable {
         return NSNull()
     }
 
-    private func play(_ arguments: Arguments) async {
+    private func play(_ arguments: Arguments, on engine: PlaybackEngine) async {
         var tracks: [LibraryTrack] = []
         for uri in arguments.strings("media") { tracks += await resolve(uri) }
         var start = 0
@@ -157,39 +171,49 @@ struct ServerAPI: Sendable {
         }
     }
 
-    /// The group, then each connected player. Only the group is offered to play on: the
-    /// players are listed so that an app finds itself, and for their own volume.
+    /// Everywhere, the user's groups, then each speaker: all of them can be played on. A
+    /// speaker names the group it plays with now, unless it plays by itself.
     private func players() async -> [[String: Any]] {
-        let snapshot = await engine.snapshot()
-        let levels = await group.levels()
-        let members = Set(await group.members().map(ObjectIdentifier.init))
-        let playing = snapshot.state == .playing
-        var list: [[String: Any]] = [[
-            "player_id": Self.groupID, "name": name, "display_name": name, "type": "group",
-            "available": true, "enabled": true, "playback_state": playing ? "playing" : "idle",
-            "volume_level": levels.volume, "group_volume": levels.volume,
-            "volume_muted": levels.muted, "group_volume_muted": levels.muted,
-        ]]
-        for session in await group.players {
+        var playing: Set<String> = []
+        var list: [[String: Any]] = []
+        let groups = await zones.groups
+        let order = [Zones.everywhereID: -1].merging(groups.enumerated().map { ($1.id, $0) }) { first, _ in first }
+        for zone in await zones.all {
+            if await zone.engine.snapshot().state == .playing { playing.insert(zone.id) }
+            guard let place = order[zone.id] else { continue }
+            let levels = await zone.group.levels()
+            list.append([
+                "player_id": zone.id, "name": zone.name, "display_name": zone.name, "type": "group",
+                "available": true, "enabled": true, "playback_state": playing.contains(zone.id) ? "playing" : "idle",
+                "volume_level": levels.volume, "group_volume": levels.volume,
+                "volume_muted": levels.muted, "group_volume_muted": levels.muted,
+                "group_members": await zones.members(of: zone.id), "order": place,
+            ])
+        }
+        list.sort { ($0["order"] as? Int ?? 0) < ($1["order"] as? Int ?? 0) }
+        for (clientID, session) in await zones.players.sorted(by: { $0.key < $1.key }) {
             let status = await session.currentStatus
-            guard let clientID = status.clientID else { continue }
-            let inGroup = members.contains(ObjectIdentifier(session))
+            let zone = await zones.zoneID(of: clientID)
             var player: [String: Any] = [
                 "player_id": clientID, "name": status.name ?? "Player", "display_name": status.name ?? "Player",
-                "type": "player", "available": status.connection == .connected, "enabled": true, "hide_in_ui": true,
-                "playback_state": inGroup && playing ? "playing" : "idle", "volume_muted": status.muted ?? false,
+                "type": "player", "available": status.connection == .connected, "enabled": true,
+                "playback_state": playing.contains(zone) ? "playing" : "idle", "volume_muted": status.muted ?? false,
             ]
             if let volume = status.volume { player["volume_level"] = volume }
-            if inGroup { player["active_group"] = Self.groupID }
+            if zone != clientID { player["active_group"] = zone }
             list.append(player)
         }
         for speaker in await speakers.speakers where speaker.enabled {
-            list.append([
-                "player_id": AirPlaySpeakers.memberID(speaker.id), "name": speaker.name, "display_name": speaker.name,
-                "type": "player", "available": speaker.present, "enabled": true, "hide_in_ui": true,
+            let id = AirPlaySpeakers.memberID(speaker.id)
+            let zone = await zones.zoneID(of: id)
+            var player: [String: Any] = [
+                "player_id": id, "name": speaker.name, "display_name": speaker.name,
+                "type": "player", "available": speaker.present, "enabled": true,
                 "playback_state": speaker.status == .playing ? "playing" : "idle", "volume_level": speaker.volume,
-                "volume_muted": speaker.muted, "active_group": Self.groupID,
-            ])
+                "volume_muted": speaker.muted,
+            ]
+            if zone != id { player["active_group"] = zone }
+            list.append(player)
         }
         return list
     }
@@ -198,13 +222,6 @@ struct ServerAPI: Sendable {
     private func speakerID(_ id: String?) -> String? {
         guard let id, id.hasPrefix("airplay:") else { return nil }
         return String(id.dropFirst("airplay:".count))
-    }
-
-    /// The connected player with this client id; nil for the group or an unknown id.
-    private func session(_ id: String?) async -> PlayerSession? {
-        guard let id, id != Self.groupID else { return nil }
-        for session in await group.players where await session.currentStatus.clientID == id { return session }
-        return nil
     }
 }
 

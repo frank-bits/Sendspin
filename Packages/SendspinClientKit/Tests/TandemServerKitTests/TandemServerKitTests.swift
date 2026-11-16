@@ -138,9 +138,14 @@ final class MusicFolder {
         await library.load(folder: folder.url)
         let group = PlaybackGroup(name: "Test", leadMs: 500)
         let store = try ServerStore(directory: folder.url.appendingPathComponent(".server"))
-        return ServerAPI(name: "Test", serverID: "id", library: library, engine: PlaybackEngine(group: group),
-                         group: group, store: store,
-                         speakers: AirPlaySpeakers(group: group, store: store) { _ in })
+        let speakers = AirPlaySpeakers(group: group, store: store) { _ in }
+        let zones = Zones(home: group, store: store, speakers: speakers) { _ in }
+        await zones.start { _ in nil }
+        return ServerAPI(name: "Test", serverID: "id", library: library, zones: zones, store: store, speakers: speakers)
+    }
+
+    private func engine(_ api: ServerAPI, _ id: String? = nil) async throws -> PlaybackEngine {
+        try #require(await api.zones.zone(id)).engine
     }
 
     private func call(_ api: ServerAPI, _ command: String, _ arguments: [String: Any] = [:]) async throws -> Data {
@@ -172,13 +177,66 @@ final class MusicFolder {
         #expect(found.playlists.isEmpty)
     }
 
-    @Test func theGroupIsTheOnePlayerOffered() async throws {
+    @Test func everywhereAndTheUsersGroupsAreOffered() async throws {
         let folder = try MusicFolder(MusicFolder.standard)
         let api = try await makeAPI(folder)
-        let players = try JSONDecoder().decode([ServerPlayer].self, from: try await call(api, "players/all"))
+        var players = try JSONDecoder().decode([ServerPlayer].self, from: try await call(api, "players/all"))
         #expect(players.map(\.playerID) == ["group"])
+        #expect(players[0].name == "Everywhere")
         #expect(players[0].isGroup)
         #expect(players[0].isSelectable)
+        await api.zones.addGroup(name: "Kitchen")
+        await api.zones.addGroup(name: "Garage")
+        players = try JSONDecoder().decode([ServerPlayer].self, from: try await call(api, "players/all"))
+        #expect(players.map(\.name) == ["Everywhere", "Kitchen", "Garage"])
+        #expect(players.allSatisfy { $0.isGroup && $0.isSelectable })
+        // They're kept for the next run, and gone once deleted.
+        #expect(api.store.syncGroups.map(\.name) == ["Kitchen", "Garage"])
+        await api.zones.deleteGroup(players[1].playerID)
+        #expect(api.store.syncGroups.map(\.name) == ["Garage"])
+    }
+
+    @Test func eachGroupHasAQueueOfItsOwn() async throws {
+        let folder = try MusicFolder(MusicFolder.standard)
+        let api = try await makeAPI(folder)
+        await api.zones.addGroup(name: "Kitchen")
+        let kitchen = try #require(await api.zones.groups.first).id
+        let late = try #require(await api.library.allAlbums(matching: "late").first)
+        let early = try #require(await api.library.allAlbums(matching: "early").first)
+        _ = try await call(api, "player_queues/play_media", ["queue_id": kitchen, "media": ["library://album/\(late.id)"]])
+        _ = try await call(api, "player_queues/play_media", ["queue_id": "group", "media": ["library://album/\(early.id)"]])
+        #expect(try await engine(api, kitchen).snapshot().current?.album == "Late")
+        #expect(try await engine(api).snapshot().current?.album == "Early")
+        _ = try await call(api, "player_queues/pause", ["queue_id": kitchen])
+        #expect(try await engine(api, kitchen).snapshot().state == .paused)
+        #expect(try await engine(api).snapshot().state == .playing)
+        let queue = try JSONDecoder().decode(QueueState.self, from: try await call(api, "player_queues/get", ["queue_id": kitchen]))
+        #expect(!queue.isPlaying)
+        #expect(queue.current?.media?.album == "Late")
+        // A queue that names nothing here plays nowhere.
+        _ = try await call(api, "player_queues/play_media", ["queue_id": "nobody", "media": ["library://album/\(late.id)"]])
+        #expect(await api.zones.all.count == 2)
+        try await engine(api).stop()
+        try await engine(api, kitchen).stop()
+    }
+
+    @Test func aGroupsMembersAreRemembered() async throws {
+        let folder = try MusicFolder(["A/B/01 C.wav"])
+        let api = try await makeAPI(folder)
+        await api.zones.addGroup(name: "Kitchen")
+        let kitchen = try #require(await api.zones.groups.first).id
+        await api.zones.setMember(.init(id: "airplay:AA", name: "Dining Room"), in: kitchen, included: true)
+        await api.zones.setMember(.init(id: "client-1", name: "Phone"), in: kitchen, included: true)
+        await api.zones.setMember(.init(id: "airplay:AA", name: "Dining Room"), in: kitchen, included: true)
+        #expect(await api.zones.members(of: kitchen) == ["client-1", "airplay:AA"])
+        await api.zones.setMember(.init(id: "client-1", name: "Phone"), in: kitchen, included: false)
+        #expect(api.store.syncGroups.first?.members.map(\.name) == ["Dining Room"])
+        // A speaker plays with Everywhere until its group starts, and again once it's taken out.
+        #expect(await api.zones.zoneID(of: "airplay:AA") == "group")
+        await api.zones.gather(kitchen)
+        #expect(await api.zones.zoneID(of: "airplay:AA") == kitchen)
+        await api.zones.setMember(.init(id: "airplay:AA", name: "Dining Room"), in: kitchen, included: false)
+        #expect(await api.zones.zoneID(of: "airplay:AA") == "group")
     }
 
     @Test func playingAnAlbumFromATrackQueuesTheWholeAlbum() async throws {
@@ -189,7 +247,7 @@ final class MusicFolder {
             "queue_id": "group", "media": ["library://album/\(late.id)"], "option": "replace",
             "start_item": "library://track/\(late.tracks[1].id)",
         ])
-        var snapshot = await api.engine.snapshot()
+        var snapshot = try await engine(api).snapshot()
         #expect(snapshot.state == .playing)
         #expect(snapshot.queue.map(\.title) == ["First", "Second", "Third"])
         #expect(snapshot.current?.title == "Second")
@@ -197,12 +255,12 @@ final class MusicFolder {
         #expect(queue.isPlaying)
         #expect(queue.current?.media?.name == "Second")
         _ = try await call(api, "player_queues/next")
-        #expect(await api.engine.snapshot().current?.title == "Third")
+        #expect(try await engine(api).snapshot().current?.title == "Third")
         // Past the end of a queue that doesn't repeat, playback stops.
         _ = try await call(api, "player_queues/next")
-        snapshot = await api.engine.snapshot()
+        snapshot = try await engine(api).snapshot()
         #expect(snapshot.state == .stopped)
-        await api.engine.stop()
+        try await engine(api).stop()
     }
 
     @Test func webPagesAndUnknownCommandsAreRefused() async throws {

@@ -31,6 +31,7 @@ struct HostView: View {
                     music
                     players
                     speakers
+                    GroupsSection(host: host)
                 }
             }
             .formStyle(.grouped)
@@ -95,7 +96,8 @@ private extension HostView {
         } header: {
             Text("AirPlay Speakers")
         } footer: {
-            Text("A speaker that's switched on is taken over when music starts, and let go soon after it stops. "
+            Text("A speaker that's switched on plays with Everywhere and can be put in groups. It's taken over "
+                + "when music starts on it, and let go soon after it stops. "
                 + "With one switched on, music starts about two seconds after you ask: that's how far ahead "
                 + "AirPlay speakers buffer. Apple TV, HomePod and Macs aren't listed; they need Apple's own AirPlay.")
         }
@@ -193,7 +195,7 @@ private struct PlayerRow: View {
         case .paired?, nil: break
         }
         switch player.connection {
-        case .connected: return "Playing here"
+        case .connected: return "Connected"
         case .pairingRequired: return "Needs pairing"
         case .notRecognized: return "Lost its pairing"
         case .awaitingApproval: return "Not allowed yet"

@@ -29,9 +29,9 @@ enum JSON {
     }
 
     /// A queue as `player_queues/get` reports it.
-    static func queue(_ snapshot: PlaybackEngine.Snapshot) -> [String: Any] {
+    static func queue(_ snapshot: PlaybackEngine.Snapshot, id: String) -> [String: Any] {
         var queue: [String: Any] = [
-            "queue_id": ServerAPI.groupID,
+            "queue_id": id,
             "state": snapshot.state == .playing ? "playing" : snapshot.state == .paused ? "paused" : "idle",
             "shuffle_enabled": snapshot.shuffle,
             "repeat_mode": snapshot.repeatMode,

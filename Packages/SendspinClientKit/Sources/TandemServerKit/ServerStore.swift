@@ -10,6 +10,7 @@ public final class ServerStore: @unchecked Sendable {
     private var allowed: Set<String>
     private var recent: [String]
     private var airPlay: [String: AirPlaySetting]
+    private var groups: [SyncGroup]
 
     private static let recentLimit = 24
 
@@ -20,6 +21,7 @@ public final class ServerStore: @unchecked Sendable {
         allowed = Set(Self.read([String].self, directory.appendingPathComponent("allowed.json")) ?? [])
         recent = Self.read([String].self, directory.appendingPathComponent("recent.json")) ?? []
         airPlay = Self.read([String: AirPlaySetting].self, directory.appendingPathComponent("airplay.json")) ?? [:]
+        groups = Self.read([SyncGroup].self, directory.appendingPathComponent("groups.json")) ?? []
     }
 
     var libraryCache: URL { directory.appendingPathComponent("library.json") }
@@ -95,6 +97,35 @@ public final class ServerStore: @unchecked Sendable {
         set {
             lock.withLock { airPlay = newValue }
             save(newValue, "airplay.json")
+        }
+    }
+
+    // MARK: Groups of speakers
+
+    /// A named set of speakers that play together, with a queue of their own.
+    public struct SyncGroup: Codable, Sendable, Equatable, Identifiable {
+        public struct Member: Codable, Sendable, Equatable, Identifiable {
+            /// A Sendspin player's client id, or an AirPlay speaker's `airplay:` id.
+            public var id: String
+            /// Its name when it was added, to list it while it's away.
+            public var name: String
+
+            public init(id: String, name: String) {
+                self.id = id
+                self.name = name
+            }
+        }
+
+        public var id: String
+        public var name: String
+        public var members: [Member]
+    }
+
+    var syncGroups: [SyncGroup] {
+        get { lock.withLock { groups } }
+        set {
+            lock.withLock { groups = newValue }
+            save(newValue, "groups.json")
         }
     }
 

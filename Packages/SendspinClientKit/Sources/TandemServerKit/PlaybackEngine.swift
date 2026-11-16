@@ -44,6 +44,10 @@ public actor PlaybackEngine {
     var artworkURL: (@Sendable (LibraryTrack) -> String?)?
     /// Called when a track starts to be heard.
     var onTrackStarted: (@Sendable (LibraryTrack) -> Void)?
+    /// Called as playback starts, before any sound: the group gathers its speakers.
+    var willStart: (@Sendable () async -> Void)?
+    /// How long a group nobody hears keeps playing: a player that dropped off may be back.
+    static let unheardLimitUs: Int64 = 30_000_000
 
     // The queue, in play order (PlaybackEngine+Queue.swift).
     var queue: [LibraryTrack] = []
@@ -81,9 +85,11 @@ public actor PlaybackEngine {
 
     /// Take the group's transport commands, and say where artwork is served.
     public func attach(artworkURL: (@Sendable (LibraryTrack) -> String?)? = nil,
-                       onTrackStarted: (@Sendable (LibraryTrack) -> Void)? = nil) async {
+                       onTrackStarted: (@Sendable (LibraryTrack) -> Void)? = nil,
+                       willStart: (@Sendable () async -> Void)? = nil) async {
         self.artworkURL = artworkURL
         self.onTrackStarted = onTrackStarted
+        self.willStart = willStart
         await group.setMedia(controls()) { [weak self] command in await self?.handle(command) }
     }
 
@@ -170,8 +176,9 @@ public actor PlaybackEngine {
         await seek(to: heard.track.duration > 0 ? min(target, heard.track.duration) : target)
     }
 
-    /// Start a new timeline with the cursor's track, `offset` seconds in.
-    func start(at offset: Double) async {
+    /// Start a new timeline with the cursor's track, `offset` seconds in. `gathering` calls in
+    /// the group's speakers from wherever they play, as the user asking for music does.
+    func start(at offset: Double, gathering: Bool = true) async {
         generation += 1
         let mine = generation
         pump?.cancel()
@@ -189,6 +196,10 @@ public actor PlaybackEngine {
         nextCaptureUs = nil
         // Shown at once, though it's heard only once the lead has passed.
         heard = Heard(cursor: cursor, track: queue[cursor], playUs: .max, offset: offset)
+        if gathering {
+            await willStart?()
+            guard mine == generation else { return }
+        }
         if wasPlaying { await group.clear() }
         guard mine == generation else { return }
         await publish()
@@ -223,6 +234,7 @@ public actor PlaybackEngine {
         guard mine == generation else { return }
         leadUs = Int64(lead) * 1_000
         var checked = ServerClock.nowMicros()
+        var heardAt = checked
         while mine == generation, !Task.isCancelled {
             let now = ServerClock.nowMicros()
             while mine == generation, (nextCaptureUs ?? 0) < now + Self.aheadUs {
@@ -243,7 +255,14 @@ public actor PlaybackEngine {
                     lead = needed
                     Log.info("A player needs \(needed) ms of lead; restarting the stream with it")
                     if let heard, queue.indices.contains(heard.cursor) { cursor = heard.cursor }
-                    await start(at: position())
+                    await start(at: position(), gathering: false)
+                    return
+                }
+                if await group.hasListeners() { heardAt = now }
+                guard mine == generation else { return }
+                if now - heardAt > Self.unheardLimitUs {
+                    Log.info("\(group.name): nobody is listening; paused")
+                    await pause()
                     return
                 }
             }

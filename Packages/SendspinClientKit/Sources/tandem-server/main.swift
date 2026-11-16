@@ -17,8 +17,14 @@ Then, on standard input:
   forget <n>         forget player n's pairing
   use <n>            take player n back, after another server had it
   speakers           list the AirPlay speakers
-  speaker <n> on|off have AirPlay speaker n play with the group, or not
+  speaker <n> on|off use AirPlay speaker n, or not
   speaker <n> <0-100> set AirPlay speaker n's volume
+  groups             list the groups of speakers; "Everywhere" is always there
+  group new <name>   make a group
+  group <n> add player <m>    put player m in group n
+  group <n> add speaker <m>   put AirPlay speaker m in group n
+  group <n> remove <m>        take group n's member m out
+  group <n> delete
   rescan             read the music folder again
   quit
 """
@@ -65,7 +71,7 @@ func describe(_ player: StandaloneServer.Player) -> String {
     } ?? false
     switch pairing ? nil : player.connection {
     case nil: text += "pairing"
-    case .connected?: text += player.paired ? "playing in the group" : "playing in the group, not paired"
+    case .connected?: text += player.paired ? "connected" : "connected, not paired"
     case .pairingRequired?: text += "needs pairing"
     case .notRecognized?: text += "lost its pairing with this server; pair it again"
     case .awaitingApproval?: text += "waits to be allowed"
@@ -110,6 +116,58 @@ func describe(_ speaker: AirPlaySpeakers.Speaker) -> String {
     return text
 }
 
+func printGroups() async {
+    let groups = await server.currentState.groups
+    let playing = await server.playingGroups()
+    print("  Everywhere: every speaker\(playing.contains("group") ? ", playing" : "")")
+    for (index, group) in groups.enumerated() {
+        let members = group.members.isEmpty ? "no speakers yet" : group.members.enumerated()
+            .map { "\($0 + 1). \($1.name)" }.joined(separator: ", ")
+        print("  \(index + 1). \(group.name): \(members)\(playing.contains(group.id) ? " - playing" : "")")
+    }
+}
+
+/// The `group …` commands.
+func group(_ words: [String]) async {
+    let state = await server.currentState
+    if words.first == "new", words.count > 1 {
+        await server.addGroup(name: words.dropFirst().joined(separator: " "))
+        return
+    }
+    guard let number = words.first.flatMap(Int.init), state.groups.indices.contains(number - 1), words.count > 1 else {
+        print("Say which group by its number; 'groups' lists them. To make one: group new <name>")
+        return
+    }
+    let group = state.groups[number - 1]
+    let index = words.last.flatMap(Int.init).map { $0 - 1 } ?? -1
+    switch (words[1], words.count) {
+    case ("delete", 2):
+        await server.deleteGroup(group.id)
+    case ("add", 4) where words[2] == "player":
+        guard state.players.indices.contains(index), let clientID = state.players[index].clientID else {
+            print("No such player, or it hasn't connected yet; 'players' lists them.")
+            return
+        }
+        await server.setGroup(group.id, member: .init(id: clientID, name: state.players[index].name), included: true)
+    case ("add", 4) where words[2] == "speaker":
+        guard state.speakers.indices.contains(index), state.speakers[index].enabled else {
+            print("No such speaker, or it's off; 'speakers' lists them, 'speaker <n> on' switches one on.")
+            return
+        }
+        let speaker = state.speakers[index]
+        await server.setGroup(group.id, member: .init(id: AirPlaySpeakers.memberID(speaker.id), name: speaker.name),
+                              included: true)
+    case ("remove", 3):
+        guard group.members.indices.contains(index) else {
+            print("\(group.name) has no member \(index + 1).")
+            return
+        }
+        await server.setGroup(group.id, member: group.members[index], included: false)
+    default:
+        print("Say: group \(number) add player <m>, add speaker <m>, remove <m>, or delete")
+    }
+}
+
 await server.start()
 let started = await server.currentState
 if let error = started.error {
@@ -132,6 +190,7 @@ Task {
             for (index, player) in state.players.enumerated() { print("  \(index + 1). \(describe(player))") }
             if state.players.isEmpty { print("  No players connected.") }
         }
+        if state.groups != last.groups, state.running { await printGroups() }
         if state.speakers.filter(\.enabled) != last.speakers.filter(\.enabled) {
             for speaker in state.speakers where speaker.enabled { print("  AirPlay: \(describe(speaker))") }
         }
@@ -191,6 +250,10 @@ for try await line in FileHandle.standardInput.bytes.lines {
         } else {
             print("Say on, off or a volume from 0 to 100.")
         }
+    case ("groups", _):
+        await printGroups()
+    case ("group", _):
+        await group(Array(words.dropFirst()))
     case ("rescan", _):
         await server.setMusicFolder(musicFolder)
     case ("quit", _), ("exit", _):

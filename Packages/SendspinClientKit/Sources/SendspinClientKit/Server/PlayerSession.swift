@@ -229,4 +229,7 @@ public actor PlayerSession {
     }
 
     public var currentStatus: PlayerStatus { status }
+
+    /// The group the player is in now.
+    public var currentGroup: PlaybackGroup? { playbackGroup }
 }
