@@ -1,4 +1,6 @@
+import CryptoKit
 import Foundation
+import Network
 import SendspinClientKit
 
 /// The group's audio on one AirPlay speaker. Blocks arrive with the time to play them on the
@@ -32,7 +34,7 @@ actor AirPlayStream {
     /// A block this far off its place on the timeline moves the timeline.
     private static let toleranceUs: Int64 = 30_000
 
-    private struct Link {
+    struct Link {
         var rtsp: RTSPClient
         var uri: String
         var audio: UDPSocket
@@ -42,29 +44,45 @@ actor AirPlayStream {
         var controlAddress: sockaddr_in
         /// The share of the latency the speaker takes, in frames.
         var receiverLatency: Int
+        /// AirPlay 2 only: the key each audio packet is sealed with, the number the stream goes
+        /// by, and the connection the speaker reports on, held open for as long as we play.
+        var audioKey: SymmetricKey?
+        var streamID: UInt32 = 0
+        var events: NWConnection?
+        /// The network clock the speaker follows, and the speaker's address on it.
+        var clock: PTPClock?
+        var remote = ""
     }
 
-    private let speaker: AirPlaySpeaker
+    let speaker: AirPlaySpeaker
     private let onStatus: @Sendable (Status) -> Void
-    private let queue = DispatchQueue(label: "tandem.airplay.stream")
-    private let history = PacketHistory()
-    private let source = UInt32.random(in: .min ... .max)
+    let queue = DispatchQueue(label: "tandem.airplay.stream")
+    let history = PacketHistory()
+    let source = UInt32.random(in: .min ... .max)
     private var volume: Int
     private var muted: Bool
     private var status = Status.idle
-    private var link: Link?
+    var link: Link?
     private var retryAfter: Int64 = 0
 
     private var resampler: (converter: Resampler, rate: Int, channels: Int)?
     /// Stereo samples that don't fill a packet yet.
     private var pending: [Int16] = []
-    private var sequence = UInt16.random(in: .min ... .max)
+    var sequence = UInt16.random(in: .min ... .max)
     /// The frame the next packet starts with. Its low 32 bits are the RTP timestamp.
-    private var nextFrame = Int64(UInt32.random(in: .min ... .max))
+    var nextFrame = Int64(UInt32.random(in: .min ... .max))
     /// A frame and the time it plays: the timeline since the stream started or was flushed.
-    private var anchor: (frame: Int64, playUs: Int64)?
-    private var firstPacket = true
+    var anchor: (frame: Int64, playUs: Int64)?
+    var firstPacket = true
     private var syncing: Task<Void, Never>?
+    /// Compresses AirPlay 2's packets; the first AirPlay's go out uncompressed.
+    private let encoder = ALACEncoder()
+    /// AirPlay 2 packets made but not due to go out yet, the earliest first.
+    private var outbox: [(sendUs: Int64, packet: Data)] = []
+    private var pacing: Task<Void, Never>?
+    /// How long before it plays an AirPlay 2 packet is sent. A speaker has room for two
+    /// seconds and drops what comes earlier, so it gets each packet a little inside that.
+    private static let sendAheadUs: Int64 = 1_750_000
     private var releasing: Task<Void, Never>?
 
     init(speaker: AirPlaySpeaker, volume: Int, muted: Bool, onStatus: @escaping @Sendable (Status) -> Void) {
@@ -167,10 +185,24 @@ actor AirPlayStream {
         }
         var offset = 0
         while pending.count - offset >= size {
-            let payload = RAOP.alacFrame(pending[offset..<offset + size])
-            let packet = RAOP.audioPacket(sequence: sequence, timestamp: UInt32(truncatingIfNeeded: nextFrame),
-                                          source: source, first: firstPacket, payload: payload)
-            link.audio.send(packet, to: link.audioAddress)
+            let block = pending[offset..<offset + size]
+            let payload = (link.audioKey != nil ? encoder?.encode(block) : nil) ?? RAOP.alacFrame(block)
+            let timestamp = UInt32(truncatingIfNeeded: nextFrame)
+            let packet: Data
+            if let key = link.audioKey {
+                guard let sealed = try? RAOP.sealedAudioPacket(sequence: sequence, timestamp: timestamp, source: link.streamID,
+                                                                first: firstPacket, payload: payload, key: key) else { break }
+                packet = sealed
+            } else {
+                packet = RAOP.audioPacket(sequence: sequence, timestamp: timestamp, source: source,
+                                          first: firstPacket, payload: payload)
+            }
+            if link.audioKey != nil, let anchor {
+                let playUs = anchor.playUs + (nextFrame - anchor.frame) * 1_000_000 / Int64(RAOP.sampleRate)
+                outbox.append((playUs - Self.sendAheadUs, packet))
+            } else {
+                link.audio.send(packet, to: link.audioAddress)
+            }
             history.store(packet, sequence: sequence)
             sequence &+= 1
             nextFrame += Int64(RAOP.framesPerPacket)
@@ -178,6 +210,28 @@ actor AirPlayStream {
             offset += size
         }
         pending.removeFirst(offset)
+        release(over: link)
+    }
+
+    /// Send the packets that are due, and come back for the rest.
+    private func release(over link: Link) {
+        let now = ServerClock.nowMicros()
+        var sent = 0
+        while sent < outbox.count, outbox[sent].sendUs <= now {
+            link.audio.send(outbox[sent].packet, to: link.audioAddress)
+            sent += 1
+        }
+        outbox.removeFirst(sent)
+        guard !outbox.isEmpty, pacing == nil else { return }
+        pacing = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(15))
+            await self?.paced()
+        }
+    }
+
+    private func paced() {
+        pacing = nil
+        if let link { release(over: link) } else { outbox = [] }
     }
 
     /// Tell the speaker, now and every second, which frame goes with which time.
@@ -201,14 +255,24 @@ actor AirPlayStream {
         // The frame that plays one latency from now is the one a sender would hand over now.
         let aheadUs = Int64(RAOP.latencyFrames) * 1_000_000 / Int64(RAOP.sampleRate)
         let frame = anchor.frame + (now + aheadUs - anchor.playUs) * Int64(RAOP.sampleRate) / 1_000_000
-        let packet = RAOP.syncPacket(first: first, timestamp: UInt32(truncatingIfNeeded: frame),
+        var packet = RAOP.syncPacket(first: first, timestamp: UInt32(truncatingIfNeeded: frame),
                                      receiverLatency: link.receiverLatency, nowMicros: RAOP.clockMicros(now))
+        if link.clock != nil {
+            let heard = anchor.frame + (now - anchor.playUs) * Int64(RAOP.sampleRate) / 1_000_000
+            packet = RAOP.clockSyncPacket(first: first, heard: UInt32(truncatingIfNeeded: heard),
+                                          clockNanos: PTPClock.nowNanos(now), clock: PTPClock.identity)
+        }
         link.control.send(packet, to: link.controlAddress)
     }
 
     private func checkAlive(_ link: Link) async {
         do {
-            _ = try await link.rtsp.send("OPTIONS", "*", lenient: true)
+            // AirPlay 2 has a request of its own for this.
+            if link.audioKey != nil {
+                _ = try await link.rtsp.send("POST", "/feedback", lenient: true)
+            } else {
+                _ = try await link.rtsp.send("OPTIONS", "*", lenient: true)
+            }
         } catch {
             if self.link?.uri == link.uri { fail(error) }
         }
@@ -219,6 +283,7 @@ actor AirPlayStream {
         syncing?.cancel()
         syncing = nil
         pending = []
+        outbox = []
         resampler?.converter.reset()
         history.clear()
         guard let link, anchor != nil else { return }
@@ -245,6 +310,16 @@ actor AirPlayStream {
     // MARK: The connection
 
     private func connect() async throws {
+        if speaker.usesAirPlay2 {
+            do {
+                try await connectAirPlay2()
+                return
+            } catch let error as PTPClock.Failure {
+                // Another program has the clock's ports. The first AirPlay needs no clock,
+                // and many speakers still play over it.
+                Log.warning("\(speaker.name): AirPlay 2 \(error); trying the first AirPlay")
+            }
+        }
         let instance = (0..<8).map { _ in String(format: "%02X", UInt8.random(in: .min ... .max)) }.joined()
         let rtsp = RTSPClient(endpoint: speaker.endpoint, headers: [
             ("User-Agent", "iTunes/7.6.2 (Windows; N;)"), ("Client-Instance", instance), ("DACP-ID", instance),
@@ -296,12 +371,7 @@ actor AirPlayStream {
             let link = Link(rtsp: rtsp, uri: uri, audio: audio, control: control.socket, timing: clock.socket,
                             audioAddress: audioAddress, controlAddress: controlAddress,
                             receiverLatency: min(max(0, latency), RAOP.latencyFrames))
-            try await sendVolume(over: link)
-            sentDetails = nil
-            try await sendDetails(over: link)
-            self.link = link
-            anchor = nil
-            firstPacket = true
+            try await begin(link)
             Log.info("\(speaker.name): AirPlay connected from \(local) (its latency \(latency) frames)")
         } catch {
             sockets.forEach { $0.close() }
@@ -318,6 +388,16 @@ actor AirPlayStream {
             if pair.count == 2 { values[pair[0].lowercased()] = pair[1] }
         }
         return values
+    }
+
+    /// The last steps of connecting, the same for both forms of AirPlay.
+    func begin(_ link: Link) async throws {
+        try await sendVolume(over: link)
+        sentDetails = nil
+        try await sendDetails(over: link)
+        self.link = link
+        anchor = nil
+        firstPacket = true
     }
 
     private func sendVolume(over link: Link) async throws {
@@ -344,8 +424,11 @@ actor AirPlayStream {
         self.link = nil
         anchor = nil
         pending = []
+        outbox = []
         _ = try? await link.rtsp.send("TEARDOWN", link.uri, lenient: true)
         link.rtsp.close()
+        link.events?.cancel()
+        link.clock?.remove(peer: link.remote)
         [link.audio, link.control, link.timing].forEach { $0.close() }
     }
 
@@ -355,6 +438,8 @@ actor AirPlayStream {
         if let link {
             self.link = nil
             link.rtsp.close()
+            link.events?.cancel()
+            link.clock?.remove(peer: link.remote)
             [link.audio, link.control, link.timing].forEach { $0.close() }
         }
         syncing?.cancel()
@@ -368,84 +453,5 @@ actor AirPlayStream {
         guard status != self.status else { return }
         self.status = status
         onStatus(status)
-    }
-}
-
-/// Answers a speaker's requests for the time, from the server's clock.
-struct TimingResponder {
-    let socket: UDPSocket
-
-    init(queue: DispatchQueue, localAddress: String) throws {
-        let box = SocketBox()
-        socket = try UDPSocket(queue: queue, localAddress: localAddress) { packet, sender in
-            guard let reply = RAOP.timingReply(to: packet, nowMicros: RAOP.clockMicros()) else {
-                Log.debug("AirPlay timing port: unknown packet \(packet.prefix(8).map { String(format: "%02x", $0) }.joined())")
-                return
-            }
-            box.socket?.send(reply, to: sender)
-        }
-        box.socket = socket
-    }
-}
-
-/// Sends again the audio packets a speaker says it missed.
-struct ResendResponder {
-    let socket: UDPSocket
-
-    init(queue: DispatchQueue, localAddress: String, history: PacketHistory) throws {
-        let box = SocketBox()
-        socket = try UDPSocket(queue: queue, localAddress: localAddress) { packet, sender in
-            guard let request = RAOP.resendRequest(packet) else {
-                Log.debug("AirPlay control port: unknown packet \(packet.prefix(8).map { String(format: "%02x", $0) }.joined())")
-                return
-            }
-            Log.debug("AirPlay: asked again for \(request.count) packets from \(request.first)")
-            for offset in 0..<min(request.count, 64) {
-                guard let lost = history.packet(request.first &+ UInt16(offset)) else { continue }
-                box.socket?.send(RAOP.resendReply(lost), to: sender)
-            }
-        }
-        box.socket = socket
-    }
-}
-
-/// A socket for its own receive handler to answer on. Set once, before any packet arrives.
-private final class SocketBox: @unchecked Sendable {
-    weak var socket: UDPSocket?
-}
-
-/// A speaker as a member of a playback group.
-final class AirPlayOutput: GroupOutput {
-    let stream: AirPlayStream
-    private let events: AsyncStream<AirPlayStream.Event>.Continuation
-
-    init(speaker: AirPlaySpeaker, volume: Int, muted: Bool, onStatus: @escaping @Sendable (AirPlayStream.Status) -> Void) {
-        let stream = AirPlayStream(speaker: speaker, volume: volume, muted: muted, onStatus: onStatus)
-        let (events, continuation) = AsyncStream.makeStream(of: AirPlayStream.Event.self)
-        self.stream = stream
-        self.events = continuation
-        // One at a time, in order: audio is a sequence.
-        Task {
-            for await event in events { await stream.handle(event) }
-            await stream.close()
-        }
-    }
-
-    func play(_ pcm: PCMBuffer, timestampUs: Int64) {
-        events.yield(.audio(pcm, playUs: timestampUs))
-    }
-
-    func stop() {
-        events.yield(.stop)
-    }
-
-    func describe(title: String?, artist: String?, album: String?) {
-        events.yield(.details(title: title, artist: artist, album: album))
-    }
-
-    /// The speaker left the group: let it go, and wait until it's told.
-    func shutdown() async {
-        events.finish()
-        await stream.close()
     }
 }

@@ -405,7 +405,7 @@ enum LocalAddress {
             var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
             guard getnameinfo(address, socklen_t(address.pointee.sa_len), &host, socklen_t(host.count), nil, 0,
                               NI_NUMERICHOST) == 0 else { continue }
-            let text = String(cString: host)
+            let text = String(decoding: host.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
             // Self-assigned addresses reach nobody.
             guard !text.hasPrefix("169.254.") else { continue }
             if String(cString: current.pointee.ifa_name).hasPrefix("en") { return text }

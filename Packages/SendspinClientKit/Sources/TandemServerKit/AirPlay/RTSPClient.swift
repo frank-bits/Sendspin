@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Network
 import SendspinClientKit
@@ -32,6 +33,10 @@ actor RTSPClient {
     private var buffer = Data()
     private var sequence = 0
     private var session: String?
+    /// Set once AirPlay 2 pairing is done: everything after goes in encrypted frames.
+    private var cipher: ControlCipher?
+    /// Encrypted bytes that don't make a whole frame yet.
+    private var sealed = Data()
     /// The request before, so that two callers don't mix their answers.
     private var last: Task<Void, Never>?
 
@@ -75,6 +80,11 @@ actor RTSPClient {
     private static func host(_ endpoint: NWEndpoint?) -> String? {
         guard case .hostPort(let host, _)? = endpoint, case .ipv4(let address) = host else { return nil }
         return "\(address)".components(separatedBy: "%").first
+    }
+
+    /// Encrypt the connection from here on, with keys made from the pairing's shared secret.
+    func secure(with secret: Data) {
+        cipher = ControlCipher(secret: secret)
     }
 
     func setSession(_ session: String?) {
@@ -126,7 +136,8 @@ actor RTSPClient {
         }
     }
 
-    private func write(_ data: Data) async throws {
+    private func write(_ plain: Data) async throws {
+        let data = try cipher?.seal(plain) ?? plain
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
             connection.send(content: data, completion: .contentProcessed { error in
                 if let error { continuation.resume(throwing: Failure.unreachable("\(error)")) } else { continuation.resume() }
@@ -172,10 +183,73 @@ actor RTSPClient {
                 }
             }
         }
-        buffer.append(data)
+        guard cipher != nil else {
+            buffer.append(data)
+            return
+        }
+        sealed.append(data)
+        guard let plain = try cipher?.open(&sealed) else { throw Failure.malformed }
+        buffer.append(plain)
     }
 
     nonisolated func close() {
         connection.cancel()
+    }
+}
+
+/// The framing AirPlay 2 puts its control connection in once paired: pieces of at most 1024
+/// bytes, each with its length in front and sealed with ChaCha20-Poly1305 under a counter.
+struct ControlCipher {
+    private let writeKey: SymmetricKey
+    private let readKey: SymmetricKey
+    private var written: UInt64 = 0
+    private var read: UInt64 = 0
+
+    static let pieceSize = 1_024
+
+    /// For the side that sends requests; `answering` swaps the keys, for the other side.
+    init(secret: Data, answering: Bool = false) {
+        func key(_ info: String) -> SymmetricKey {
+            HKDF<SHA512>.deriveKey(inputKeyMaterial: SymmetricKey(data: secret), salt: Data("Control-Salt".utf8),
+                                   info: Data(info.utf8), outputByteCount: 32)
+        }
+        let ours = key("Control-Write-Encryption-Key"), theirs = key("Control-Read-Encryption-Key")
+        (writeKey, readKey) = answering ? (theirs, ours) : (ours, theirs)
+    }
+
+    private static func nonce(_ count: UInt64) throws -> ChaChaPoly.Nonce {
+        var bytes = Data(count: 4)
+        withUnsafeBytes(of: count.littleEndian) { bytes.append(contentsOf: $0) }
+        return try ChaChaPoly.Nonce(data: bytes)
+    }
+
+    mutating func seal(_ plain: Data) throws -> Data {
+        var out = Data()
+        var rest = plain[...]
+        while !rest.isEmpty {
+            let piece = rest.prefix(Self.pieceSize)
+            let length = Data([UInt8(piece.count & 0xFF), UInt8(piece.count >> 8)])
+            let box = try ChaChaPoly.seal(piece, using: writeKey, nonce: Self.nonce(written), authenticating: length)
+            out += length + box.ciphertext + box.tag
+            written += 1
+            rest = rest.dropFirst(piece.count)
+        }
+        return out
+    }
+
+    /// Open every whole frame at the front of `sealed`, leaving what's incomplete in it.
+    mutating func open(_ sealed: inout Data) throws -> Data {
+        var plain = Data()
+        while sealed.count >= 2 {
+            let length = Int(sealed[sealed.startIndex]) | Int(sealed[sealed.startIndex + 1]) << 8
+            guard sealed.count >= 2 + length + 16 else { break }
+            let body = sealed.dropFirst(2)
+            let box = try ChaChaPoly.SealedBox(nonce: Self.nonce(read), ciphertext: body.prefix(length),
+                                               tag: body.dropFirst(length).prefix(16))
+            plain += try ChaChaPoly.open(box, using: readKey, authenticating: sealed.prefix(2))
+            read += 1
+            sealed = Data(sealed.dropFirst(2 + length + 16))
+        }
+        return plain
     }
 }

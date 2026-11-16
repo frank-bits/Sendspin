@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import SendspinClientKit
 
@@ -56,6 +57,19 @@ enum RAOP {
         return packet
     }
 
+    /// The same for a speaker that follows our network clock (`PTPClock`): the frame heard at
+    /// `clockNanos` on that clock, the speaker's quarter second ahead of it, and where the
+    /// speaker's buffer ends.
+    static func clockSyncPacket(first: Bool, heard: UInt32, clockNanos: UInt64, clock: UInt64) -> Data {
+        var packet = Data([first ? 0x90 : 0x80, 0xD7, 0x00, 0x06])
+        let position = heard &+ 11_035
+        packet.append(bigEndian: position)
+        packet.append(bigEndian: clockNanos)
+        packet.append(bigEndian: position &+ UInt32(latencyFrames - receiverLatencyFrames))
+        packet.append(bigEndian: clock)
+        return packet
+    }
+
     /// The answer to a receiver asking for the time; nil for anything else.
     static func timingReply(to request: Data, nowMicros: Int64) -> Data? {
         let request = Data(request)
@@ -66,6 +80,20 @@ enum RAOP {
         reply.append(bigEndian: ntp(nowMicros))
         reply.append(bigEndian: ntp(nowMicros))
         return reply
+    }
+
+    /// An audio packet as AirPlay 2 carries it: the frame sealed with ChaCha20-Poly1305 under
+    /// the stream's key, then the seal's tag and the eight bytes of the nonce that vary. The
+    /// nonce holds the packet's number; the timestamp and source are sealed in with it.
+    static func sealedAudioPacket(sequence: UInt16, timestamp: UInt32, source: UInt32, first: Bool, payload: Data,
+                                  key: SymmetricKey) throws -> Data {
+        let header = audioPacket(sequence: sequence, timestamp: timestamp, source: source, first: first, payload: Data())
+        var nonce = Data(count: 12)
+        nonce[4] = UInt8(sequence & 0xFF)
+        nonce[5] = UInt8(sequence >> 8)
+        let box = try ChaChaPoly.seal(payload, using: key, nonce: ChaChaPoly.Nonce(data: nonce),
+                                      authenticating: header.dropFirst(4))
+        return header + box.ciphertext + box.tag + nonce.dropFirst(4)
     }
 
     /// What plays, as the tagged list AirPlay carries it in. A Sonos speaker plays nothing
