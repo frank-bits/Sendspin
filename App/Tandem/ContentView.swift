@@ -62,6 +62,7 @@ private struct ConnectionView: View {
     let deviceName: String
     @State private var confirmingForget = false
     @AppStorage(VolumeStyle.key) private var volumeStyle = VolumeStyle.standard
+    @AppStorage(OutputDevice.userDelayKey) private var soundDelay = 0
 
     var body: some View {
         content
@@ -131,10 +132,22 @@ private struct ConnectionView: View {
                     }
                 }
             }
+            #if os(tvOS)
+            // A television plays sound a little after it gets it; this much earlier we send it.
+            Picker("TV Sound Delay", selection: $soundDelay) {
+                ForEach(Array(stride(from: 0, through: 300, by: 25)), id: \.self) { delay in
+                    Text(delay == 0 ? "None" : "\(delay) ms").tag(delay)
+                }
+            }
+            .pickerStyle(.menu)
+            #endif
+            // A TV's volume is its remote's.
+            #if !os(tvOS)
             Picker("Volume Control", selection: $volumeStyle) {
                 ForEach(VolumeStyle.allCases) { Text($0.title).tag($0) }
             }
             .pickerStyle(.menu)
+            #endif
             Button("Forget Pairing…", role: .destructive) { confirmingForget = true }
         } label: {
             Label("Options", systemImage: "ellipsis.circle")
@@ -174,7 +187,9 @@ private struct PairingCodeView: View {
             Text("\(String(code.prefix(3)))-\(String(code.suffix(3)))")
                 .font(.system(size: 56, weight: .semibold, design: .rounded))
                 .monospacedDigit()
+                #if !os(tvOS)
                 .textSelection(.enabled)
+                #endif
                 .accessibilityLabel(code.map(String.init).joined(separator: " "))
             Text("Enter this code on the server.")
                 .foregroundStyle(.secondary)

@@ -1,11 +1,12 @@
 # Generate the Xcode project with `xcodegen generate` in this directory.
-# "Tandem" is a working name; the bundle identifier is a placeholder to replace before distribution.
+# The bundle identifier is the one registered with Apple, with MusicKit switched on for it.
 name: Tandem
 options:
-  bundleIdPrefix: app.tandem
+  bundleIdPrefix: com.tandemplayer
   deploymentTarget:
     iOS: "17.0"
     macOS: "14.0"
+    tvOS: "17.0"
   createIntermediateGroups: true
 packages:
   SendspinClientKit:
@@ -16,7 +17,7 @@ settings:
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
     PRODUCT_NAME: Tandem
-    PRODUCT_BUNDLE_IDENTIFIER: app.tandem.player
+    PRODUCT_BUNDLE_IDENTIFIER: com.tandemplayer.tandemplayer
 targets:
   Tandem-iOS:
     type: application
@@ -57,6 +58,36 @@ targets:
         # Xcode manages the provisioning profile, for running on a real device.
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: CTGZ35NG7K
+  # The Apple TV: a player in time with the others, and the library from the sofa. It's no
+  # server, and has no web view, so it leaves the Host and Music Assistant screens out.
+  Tandem-tvOS:
+    type: application
+    platform: tvOS
+    sources:
+      - path: Tandem
+        # There's no web view on an Apple TV.
+        excludes: [MusicAssistantWebView.swift]
+    scheme: {}
+    dependencies:
+      - package: SendspinClientKit
+        product: SendspinClientKit
+      - package: SendspinClientKit
+        product: MusicAssistantKit
+    info:
+      path: Generated/Info-tvOS.plist
+      properties:
+        CFBundleDisplayName: Tandem
+        UILaunchScreen: {}
+        UIBackgroundModes: [audio]
+        NSLocalNetworkUsageDescription: Tandem finds and connects to Sendspin servers, such as Music Assistant, on your network.
+        NSBonjourServices: ["_sendspin-server._tcp", "_mass._tcp"]
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+    settings:
+      base:
+        TARGETED_DEVICE_FAMILY: "3"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: CTGZ35NG7K
   Tandem-macOS:
     type: application
     platform: macOS
@@ -76,8 +107,12 @@ targets:
       properties:
         CFBundleDisplayName: Tandem
         LSApplicationCategoryType: public.app-category.music
+        # The Host plays Apple Music through MusicKit and hears it with a tap on system audio.
+        NSAppleMusicUsageDescription: Tandem searches Apple Music and plays its songs on your speakers.
+        NSAudioCaptureUsageDescription: Tandem captures the Apple Music songs it plays, to send them to your speakers in sync.
         NSLocalNetworkUsageDescription: Tandem finds and connects to Sendspin servers, such as Music Assistant, on your network.
-        NSBonjourServices: ["_sendspin-server._tcp", "_mass._tcp"]
+        # The last two are for the Host: the players and the AirPlay speakers it looks for.
+        NSBonjourServices: ["_sendspin-server._tcp", "_mass._tcp", "_sendspin._tcp", "_raop._tcp"]
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
     settings:

@@ -1,6 +1,26 @@
 import SendspinClientKit
 import SwiftUI
 
+/// How the volume is set: the user's choice, kept between launches.
+enum VolumeStyle: String, CaseIterable, Identifiable {
+    case buttons, knob, slider
+
+    static let key = "volumeStyle"
+    static let standard = VolumeStyle.buttons
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .buttons: "Buttons"
+        case .knob: "Knob"
+        case .slider: "Slider"
+        }
+    }
+}
+
+// Touch and pointer controls; the Apple TV has a screen of its own (NowPlayingTVView.swift).
+#if !os(tvOS)
 /// What a player or group is playing, with its transport and volume controls.
 struct NowPlayingView: View {
     let source: any NowPlayingSource
@@ -136,24 +156,6 @@ private struct ProgressRow: View {
     static func time(_ milliseconds: Double) -> String {
         let seconds = Int(milliseconds / 1000)
         return String(format: "%d:%02d", seconds / 60, seconds % 60)
-    }
-}
-
-/// How the volume is set: the user's choice, kept between launches.
-enum VolumeStyle: String, CaseIterable, Identifiable {
-    case buttons, knob, slider
-
-    static let key = "volumeStyle"
-    static let standard = VolumeStyle.buttons
-
-    var id: Self { self }
-
-    var title: String {
-        switch self {
-        case .buttons: "Buttons"
-        case .knob: "Knob"
-        case .slider: "Slider"
-        }
     }
 }
 
@@ -366,3 +368,4 @@ private struct VolumeKnob: View {
             }
     }
 }
+#endif

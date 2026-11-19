@@ -1,6 +1,7 @@
 #if os(macOS)
 import AppKit
 import Foundation
+import MusicKit
 import SendspinClientKit
 import TandemServerKit
 
@@ -22,25 +23,72 @@ final class HostModel {
         }
     }
 
+    /// Whether Apple Music is searched and played beside the folder.
+    var usesAppleMusic: Bool {
+        didSet {
+            guard usesAppleMusic != oldValue else { return }
+            UserDefaults.standard.set(usesAppleMusic, forKey: Self.appleMusicKey)
+            Task { await applyAppleMusic() }
+        }
+    }
+    /// Why Apple Music can't be used though it's switched on.
+    private(set) var appleMusicProblem: String?
+
     let serverName: String
     private var server: StandaloneServer?
     private var watching: Task<Void, Never>?
 
     private static let enabledKey = "host.enabled"
     private static let folderKey = "host.musicFolder"
+    private static let appleMusicKey = "host.appleMusic"
 
     init() {
         serverName = "Tandem on \(Host.current().localizedName ?? "this Mac")"
         folder = UserDefaults.standard.string(forKey: Self.folderKey).map { URL(fileURLWithPath: $0) }
         isEnabled = UserDefaults.standard.bool(forKey: Self.enabledKey)
+        usesAppleMusic = UserDefaults.standard.bool(forKey: Self.appleMusicKey)
         if isEnabled { start() }
+        if usesAppleMusic { Task { await checkAppleMusic() } }
+    }
+
+    /// Ask for Apple Music if it's wanted, then run the server with or without it.
+    private func applyAppleMusic() async {
+        await checkAppleMusic()
+        guard isEnabled else { return }
+        watching?.cancel()
+        watching = nil
+        let stopping = server
+        server = nil
+        await stopping?.stop()
+        if isEnabled { start() }
+    }
+
+    private func checkAppleMusic() async {
+        appleMusicProblem = nil
+        guard usesAppleMusic else { return }
+        guard #available(macOS 14.2, *) else {
+            appleMusicProblem = "Apple Music needs macOS 14.2 or later."
+            return
+        }
+        if await MusicAuthorization.request() != .authorized {
+            appleMusicProblem = "Tandem isn't allowed to use Apple Music. Allow it in System Settings, under "
+                + "Privacy & Security, Media & Apple Music."
+        } else if let subscription = try? await MusicSubscription.current, !subscription.canPlayCatalogContent {
+            appleMusicProblem = "The Apple Account on this Mac has no Apple Music subscription."
+        }
+    }
+
+    private var providers: [StreamingProvider] {
+        guard usesAppleMusic, #available(macOS 14.2, *), AppleMusicProvider.isAuthorized else { return [] }
+        return [AppleMusicProvider()]
     }
 
     private func start() {
         guard server == nil else { return }
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let server = StandaloneServer(configuration: .init(
-            name: serverName, dataDirectory: support.appendingPathComponent("Tandem/Server"), musicFolder: folder))
+            name: serverName, dataDirectory: support.appendingPathComponent("Tandem/Server"), musicFolder: folder,
+            providers: providers))
         self.server = server
         watching = Task { [weak self] in
             await server.start()

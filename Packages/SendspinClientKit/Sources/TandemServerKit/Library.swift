@@ -16,9 +16,13 @@ public struct LibraryTrack: Codable, Sendable, Hashable, Identifiable {
     public var duration: Double
     /// The file's modification time when it was read, to notice a changed file.
     public var modified: Double
+    /// A streamed track's picture, as an address anyone can fetch (Streaming.swift).
+    public var artwork: String?
+    /// A streamed track's album, as its provider names it.
+    public var streamAlbumID: String?
 
     public var url: URL { URL(fileURLWithPath: path) }
-    public var albumID: String { Library.identifier("album", albumArtist, album) }
+    public var albumID: String { streamAlbumID ?? Library.identifier("album", albumArtist, album) }
     public var artistID: String { Library.identifier("artist", albumArtist) }
 }
 
@@ -28,6 +32,8 @@ public struct LibraryAlbum: Sendable, Hashable, Identifiable {
     public var artist: String
     public var year: Int?
     public var tracks: [LibraryTrack]
+    /// A streamed album's picture, as an address anyone can fetch.
+    public var artwork: String?
 }
 
 public struct LibraryArtist: Sendable, Hashable, Identifiable {

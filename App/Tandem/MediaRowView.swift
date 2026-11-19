@@ -165,6 +165,7 @@ struct MediaTile: View {
 
 /// What's playing, along the bottom of the library: a way to pause, and back to the player.
 struct MiniPlayerBar: View {
+    private static var bar: Material { BarBackground.material }
     let source: any NowPlayingSource
     let showPlayer: () -> Void
 
@@ -208,7 +209,7 @@ struct MiniPlayerBar: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
-            .background(.bar)
+            .background(Self.bar)
         }
     }
 }
@@ -216,6 +217,7 @@ struct MiniPlayerBar: View {
 /// Where picked music plays, with the way to send it to another player or group.
 struct PlayerPickerBar: View {
     let library: LibraryModel
+    private static var bar: Material { BarBackground.material }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -239,7 +241,7 @@ struct PlayerPickerBar: View {
         .font(.subheadline)
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
-        .background(.bar)
+        .background(Self.bar)
         .task { await library.loadPlayers() }
     }
 
@@ -251,5 +253,16 @@ struct PlayerPickerBar: View {
         library.choosePlayer(library.players.first { $0.playerID == id })
         // The list may be stale by the next time the menu opens.
         Task { await library.loadPlayers() }
+    }
+}
+
+/// What a bar along an edge is drawn on. Apple TV has no bar material of its own.
+enum BarBackground {
+    static var material: Material {
+        #if os(tvOS)
+        .regularMaterial
+        #else
+        .bar
+        #endif
     }
 }

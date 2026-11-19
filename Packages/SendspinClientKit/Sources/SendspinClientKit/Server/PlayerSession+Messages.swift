@@ -144,8 +144,9 @@ extension PlayerSession {
         await askApprovals()
         guard speakerApproved || inputApproved else {
             if isIncoming || awaitsInputApproval { return holdIncoming() }
-            Log.warning("\(hello.name): identity \(status.clientID ?? "?") isn't the approved one")
-            return .stop(.notApproved)
+            // A found player isn't held on an idle connection: allowing it dials it again.
+            Log.info("\(hello.name): hasn't been allowed to play without pairing")
+            return .stop(.awaitingApproval)
         }
         activatePlayback()
         return nil

@@ -15,9 +15,12 @@ public actor StandaloneServer {
         public var apiPort: UInt16
         /// Connect to players that announce a loopback address too: test players on this machine.
         public var dialsLoopback: Bool
+        /// Streaming services to search and play from, beside the folder.
+        public var providers: [StreamingProvider]
 
         public init(name: String, dataDirectory: URL, musicFolder: URL? = nil, apiPort: UInt16 = 8929,
-                    dialsLoopback: Bool = false) {
+                    dialsLoopback: Bool = false, providers: [StreamingProvider] = []) {
+            self.providers = providers
             self.name = name
             self.dataDirectory = dataDirectory
             self.musicFolder = musicFolder
@@ -113,11 +116,11 @@ public actor StandaloneServer {
                 Task { await self?.groupsChanged(groups) }
             }
             let api = ServerAPI(name: configuration.name, serverID: identity.id, library: library, zones: zones,
-                                store: store, speakers: airPlay)
+                                store: store, speakers: airPlay, providers: configuration.providers)
             let http = HTTPServer { await api.respond(to: $0) }
             let port = try await http.start(port: configuration.apiPort)
-            await zones.start { track in
-                LocalAddress.primaryIPv4().map { "http://\($0):\(port)/imageproxy/\(track.albumID)?size=512" }
+            await zones.start(providers: configuration.providers) { track in
+                track.artwork ?? LocalAddress.primaryIPv4().map { "http://\($0):\(port)/imageproxy/\(track.albumID)?size=512" }
             }
             let listener = ServiceListener(name: configuration.name, kind: .server, txt: [Self.apiPortKey: "\(port)"])
             listener.start()

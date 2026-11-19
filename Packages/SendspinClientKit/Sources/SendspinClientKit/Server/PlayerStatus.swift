@@ -15,9 +15,8 @@ public struct PlayerStatus: Sendable, Equatable {
         /// record to make room): it can't play until paired again (connection.md, Sentinel
         /// Fallback).
         case notRecognized
-        /// The player presents a different identity than the one approved for it.
-        case notApproved
-        /// A player that connected to us, held until the user allows it (ticks it).
+        /// An unpaired player the user hasn't allowed yet: one that connected to us is held
+        /// until then, one we found is dialed again once allowed.
         case awaitingApproval
         /// The player left the group: it's in use by something else (`available: false`) or
         /// sent `client/leave`. It stays connected in a stopped group of its own until the

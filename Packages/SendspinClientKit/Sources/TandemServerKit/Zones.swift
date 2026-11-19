@@ -25,6 +25,7 @@ actor Zones {
     private let home: PlaybackGroup
     private let onChange: @Sendable ([ServerStore.SyncGroup]) -> Void
     private var artworkURL: (@Sendable (LibraryTrack) -> String?)?
+    private var providers: [StreamingProvider] = []
     private var zones: [String: Zone] = [:]
     private var syncGroups: [ServerStore.SyncGroup] = []
     /// The zone each speaker plays with, by member id; Everywhere for those not listed.
@@ -42,8 +43,9 @@ actor Zones {
     }
 
     /// Make Everywhere and the saved groups ready to play.
-    func start(artworkURL: @escaping @Sendable (LibraryTrack) -> String?) async {
+    func start(providers: [StreamingProvider] = [], artworkURL: @escaping @Sendable (LibraryTrack) -> String?) async {
         self.artworkURL = artworkURL
+        self.providers = providers
         syncGroups = store.syncGroups
         _ = await makeZone(id: Self.everywhereID, name: Self.everywhereName, group: home)
         for group in syncGroups { _ = await makeZone(id: group.id, name: group.name) }
@@ -65,7 +67,7 @@ actor Zones {
         let zone = Zone(id: id, name: name, group: group, engine: PlaybackEngine(group: group))
         zones[id] = zone
         let store = store
-        await zone.engine.attach(artworkURL: artworkURL, onTrackStarted: { store.played(albumID: $0.albumID) },
+        await zone.engine.attach(providers: providers, artworkURL: artworkURL, onTrackStarted: { store.played(albumID: $0.albumID) },
                                  willStart: { [weak self] in await self?.gather(id) })
         // So that a player moved here shows this queue, not the one it came from.
         await zone.engine.publish()

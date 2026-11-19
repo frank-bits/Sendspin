@@ -82,7 +82,10 @@ public final class SendspinClient {
         servers = found
         guard runTask == nil, wantsConnection else { return }
         let last = UserDefaults.standard.string(forKey: Self.lastServerKey)
-        if let server = found.first(where: { $0.instanceName == last }) ?? (found.count == 1 ? found.first : nil) {
+        // The only server there is, is taken only while none was chosen before: servers show up
+        // one by one, and the first seen would otherwise replace the one used last.
+        let only = last == nil && found.count == 1 ? found.first : nil
+        if let server = found.first(where: { $0.instanceName == last }) ?? only {
             connect(to: server)
         }
     }

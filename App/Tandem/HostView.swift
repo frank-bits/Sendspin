@@ -40,7 +40,7 @@ struct HostView: View {
     }
 
     private var music: some View {
-        Section("Music") {
+        Section {
             LabeledContent("Folder") {
                 HStack {
                     Text(host.folder?.path(percentEncoded: false) ?? "None chosen")
@@ -58,6 +58,16 @@ struct HostView: View {
                         .disabled(host.folder == nil || host.state.library.isScanning)
                 }
             }
+            Toggle("Apple Music", isOn: $host.usesAppleMusic)
+            if let problem = host.appleMusicProblem {
+                Label(problem, systemImage: "exclamationmark.triangle").foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("Music")
+        } footer: {
+            Text("With Apple Music on, searches also find its songs and albums. They play through this Mac, "
+                + "which stays silent itself: macOS asks once to let Tandem record system audio. One group at "
+                + "a time can play Apple Music.")
         }
     }
 
@@ -203,7 +213,6 @@ private struct PlayerRow: View {
         case .connecting: return "Connecting…"
         case .taken: return "In use by another server"
         case .unavailable: return "Can't be reached"
-        case .notApproved: return "Not the device that was allowed"
         case .failed(let reason): return reason
         case .disconnected: return "Not connected"
         }

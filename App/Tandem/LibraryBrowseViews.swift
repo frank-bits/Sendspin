@@ -170,7 +170,9 @@ struct MediaDetailView: View {
             Section {
                 header
                     .frame(maxWidth: .infinity)
+                    #if !os(tvOS)
                     .listRowSeparator(.hidden)
+                    #endif
             }
             if let children {
                 Section {

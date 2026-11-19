@@ -1,6 +1,6 @@
 import AudioToolbox
 import Foundation
-#if os(iOS)
+#if os(iOS) || os(tvOS)
 import AVFAudio
 #endif
 
@@ -45,7 +45,7 @@ public final class AudioOutput: @unchecked Sendable {
     public init(sampleRate: Int) {
         self.sampleRate = sampleRate
         playout = PlayoutBuffer(sampleRate: sampleRate)
-        latencyUs = OutputDevice.latencyUs()
+        latencyUs = OutputDevice.latencyUs() + OutputDevice.userDelayUs()
     }
 
     deinit {
@@ -109,11 +109,11 @@ public final class AudioOutput: @unchecked Sendable {
         guard wanted != running else { return }
         if wanted {
             do {
-                #if os(iOS)
+                #if os(iOS) || os(tvOS)
                 try AVAudioSession.sharedInstance().setCategory(.playback)
                 try AVAudioSession.sharedInstance().setActive(true)
                 #endif
-                let latency = OutputDevice.latencyUs()
+                let latency = OutputDevice.latencyUs() + OutputDevice.userDelayUs()
                 lock.withLock { latencyUs = latency }
                 let unit = try unit ?? makeUnit()
                 self.unit = unit

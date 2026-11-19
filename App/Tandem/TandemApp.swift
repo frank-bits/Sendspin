@@ -1,6 +1,6 @@
 import SendspinClientKit
 import SwiftUI
-#if os(iOS)
+#if os(iOS) || os(tvOS)
 import UIKit
 #endif
 
@@ -45,7 +45,7 @@ final class AppModel {
     #endif
 
     init() {
-        #if os(iOS)
+        #if os(iOS) || os(tvOS)
         let device = UIDevice.current.name
         let product = UIDevice.current.model
         #else

@@ -38,6 +38,8 @@ public actor PlaybackEngine {
     static let minimumLeadMs = 500
     /// How far ahead of the clock files are decoded and sent on.
     static let aheadUs: Int64 = 200_000
+    /// How far ahead of the clock a streamed track is placed: room for its blocks to arrive.
+    static let liveAheadUs: Int64 = 150_000
 
     let group: PlaybackGroup
     /// Where players can fetch a track's picture; set by the server once it knows its address.
@@ -61,6 +63,10 @@ public actor PlaybackEngine {
 
     // Decoding.
     private var source: AudioFileSource?
+    /// The cursor's track when it's streamed (Streaming.swift), and whether any of it arrived.
+    private var live: LiveStream?
+    private var liveHeard = false
+    var providers: [StreamingProvider] = []
     /// Seconds into the cursor's track decoding starts at.
     private var startOffset = 0.0
     /// The next block is the first of its track on this timeline.
@@ -84,9 +90,10 @@ public actor PlaybackEngine {
     }
 
     /// Take the group's transport commands, and say where artwork is served.
-    public func attach(artworkURL: (@Sendable (LibraryTrack) -> String?)? = nil,
+    public func attach(providers: [StreamingProvider] = [], artworkURL: (@Sendable (LibraryTrack) -> String?)? = nil,
                        onTrackStarted: (@Sendable (LibraryTrack) -> Void)? = nil,
                        willStart: (@Sendable () async -> Void)? = nil) async {
+        self.providers = providers
         self.artworkURL = artworkURL
         self.onTrackStarted = onTrackStarted
         self.willStart = willStart
@@ -189,6 +196,7 @@ public actor PlaybackEngine {
         let wasPlaying = state == .playing
         state = .playing
         source = nil
+        closeLive()
         startOffset = offset
         unreadable = 0
         upcoming = []
@@ -219,6 +227,7 @@ public actor PlaybackEngine {
         }
         state = newState
         source = nil
+        closeLive()
         startOffset = offset
         upcoming = []
         await group.setPlaying(false)
@@ -237,12 +246,16 @@ public actor PlaybackEngine {
         var heardAt = checked
         while mine == generation, !Task.isCancelled {
             let now = ServerClock.nowMicros()
-            while mine == generation, (nextCaptureUs ?? 0) < now + Self.aheadUs {
-                guard let (block, captureUs) = nextBlock(now: now) else {
+            reading: while mine == generation, (nextCaptureUs ?? 0) < now + Self.aheadUs {
+                switch nextBlock(now: now) {
+                case .over:
                     await finish(mine)
                     return
+                case .wait:
+                    break reading
+                case .block(let block, let captureUs):
+                    await group.push(block, captureTimeUs: captureUs)
                 }
-                await group.push(block, captureTimeUs: captureUs)
             }
             guard mine == generation else { return }
             await applyDue()
@@ -270,11 +283,69 @@ public actor PlaybackEngine {
         }
     }
 
-    /// The next block of the queue and its place on the timeline; nil when the queue is over.
-    private func nextBlock(now: Int64) -> (PCMBuffer, Int64)? {
+    private enum Next {
+        case block(PCMBuffer, Int64)
+        /// A streamed track has nothing to send yet.
+        case wait
+        case over
+    }
+
+    private func closeLive() {
+        live?.close()
+        live = nil
+    }
+
+    /// The next block of the queue and its place on the timeline; `.over` when the queue is.
+    private func nextBlock(now: Int64) -> Next {
         while true {
+            if source == nil, live == nil {
+                guard queue.indices.contains(cursor) else { return .over }
+                if let providerID = queue[cursor].providerID {
+                    guard let provider = providers.first(where: { $0.id == providerID }) else {
+                        Log.warning("Can't play \(queue[cursor].title): no \(providerID) here")
+                        unreadable += 1
+                        guard unreadable < queue.count, step() else { return .over }
+                        continue
+                    }
+                    live = provider.open(queue[cursor], at: startOffset)
+                    liveHeard = false
+                    announce = true
+                }
+            }
+            if let live {
+                let block: PCMBuffer
+                switch live.read() {
+                case .wait:
+                    return .wait
+                case .ended:
+                    closeLive()
+                    // Streamed tracks that all fail, on repeat, would never end.
+                    unreadable = liveHeard ? 0 : unreadable + 1
+                    guard unreadable < max(1, queue.count), step() else { return .over }
+                    continue
+                case .block(let captured):
+                    block = captured
+                }
+                liveHeard = true
+                unreadable = 0
+                // A stream is placed as it arrives: a timeline left by what played before, or
+                // one the capture fell behind on, starts again just ahead of now.
+                var captureUs = segment.map { $0.startUs + $0.frames * 1_000_000 / Int64($0.sampleRate) } ?? 0
+                if segment?.sampleRate != block.sampleRate || captureUs < now + 10_000 || captureUs > now + 1_000_000 {
+                    segment = (now + Self.liveAheadUs, block.sampleRate, 0)
+                    captureUs = now + Self.liveAheadUs
+                }
+                guard var run = segment else { return .over }
+                run.frames += Int64(block.frameCount)
+                segment = run
+                nextCaptureUs = run.startUs + run.frames * 1_000_000 / Int64(run.sampleRate)
+                if announce {
+                    announce = false
+                    upcoming.append(Heard(cursor: cursor, track: queue[cursor], playUs: captureUs + leadUs, offset: startOffset))
+                }
+                return .block(block, captureUs)
+            }
             if source == nil {
-                guard queue.indices.contains(cursor) else { return nil }
                 do {
                     let opened = try AudioFileSource(url: queue[cursor].url)
                     opened.seek(to: startOffset)
@@ -284,20 +355,20 @@ public actor PlaybackEngine {
                     Log.warning("Can't play \(queue[cursor].path): \(error)")
                     unreadable += 1
                     // A queue of nothing but unreadable files, on repeat, would never end.
-                    guard unreadable < queue.count, step() else { return nil }
+                    guard unreadable < queue.count, step() else { return .over }
                     continue
                 }
             }
             guard let block = source?.next() else {
                 source = nil
-                guard step() else { return nil }
+                guard step() else { return .over }
                 continue
             }
             unreadable = 0
             if segment == nil || segment?.sampleRate != block.sampleRate {
                 segment = (nextCaptureUs ?? now + 60_000, block.sampleRate, 0)
             }
-            guard var run = segment else { return nil }
+            guard var run = segment else { return .over }
             let captureUs = run.startUs + run.frames * 1_000_000 / Int64(run.sampleRate)
             run.frames += Int64(block.frameCount)
             segment = run
@@ -306,7 +377,7 @@ public actor PlaybackEngine {
                 announce = false
                 upcoming.append(Heard(cursor: cursor, track: queue[cursor], playUs: captureUs + leadUs, offset: startOffset))
             }
-            return (block, captureUs)
+            return .block(block, captureUs)
         }
     }
 

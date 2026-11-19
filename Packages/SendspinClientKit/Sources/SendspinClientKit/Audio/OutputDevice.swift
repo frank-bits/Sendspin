@@ -8,6 +8,15 @@ import AVFAudio
 /// The system's current audio output: its sample rate, and how long after a render timestamp
 /// a frame is heard.
 public enum OutputDevice {
+    /// Where the user's own correction is kept, in milliseconds: the delay of what the sound
+    /// passes through after this device, such as a television, which the system can't know.
+    public static let userDelayKey = "outputDelayMs"
+
+    /// That correction, in microseconds. It takes effect when playback next starts.
+    public static func userDelayUs() -> Double {
+        Double(UserDefaults.standard.integer(forKey: userDelayKey)) * 1_000
+    }
+
     #if os(macOS)
     public static func sampleRate() -> Int {
         guard let device = defaultOutput(),

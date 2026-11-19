@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "SendspinClientKit",
-    platforms: [.macOS(.v14), .iOS(.v17)],
+    platforms: [.macOS(.v14), .iOS(.v17), .tvOS(.v17)],
     products: [
         .library(name: "SendspinClientKit", targets: ["SendspinClientKit"]),
         .library(name: "MusicAssistantKit", targets: ["MusicAssistantKit"]),

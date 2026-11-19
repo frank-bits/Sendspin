@@ -17,6 +17,7 @@ struct ServerAPI: Sendable {
     let zones: Zones
     let store: ServerStore
     let speakers: AirPlaySpeakers
+    var providers: [StreamingProvider] = []
     let artwork = ArtworkCache()
 
     func respond(to request: HTTPRequest) async -> HTTPResponse {
@@ -52,10 +53,20 @@ struct ServerAPI: Sendable {
         case "music/search":
             let query = arguments.string("search_query") ?? ""
             let limit = arguments.int("limit") ?? 8
+            // The folder's music first, then what each streaming service finds.
+            var albums = await library.allAlbums(matching: query, limit: limit)
+            var tracks = await library.allTracks(matching: query, limit: limit)
+            if !query.isEmpty {
+                for provider in providers {
+                    let found = await provider.search(query, limit: limit)
+                    albums += found.albums
+                    tracks += found.tracks
+                }
+            }
             return [
                 "artists": await library.allArtists(matching: query, limit: limit).map(JSON.artist),
-                "albums": await library.allAlbums(matching: query, limit: limit).map(JSON.album),
-                "tracks": await library.allTracks(matching: query, limit: limit).map(JSON.track),
+                "albums": albums.map(JSON.album),
+                "tracks": tracks.map(JSON.track),
                 "playlists": [Any](), "radio": [Any](), "podcasts": [Any](), "audiobooks": [Any](),
             ] as [String: Any]
         case "music/recently_played_items":
@@ -78,7 +89,9 @@ struct ServerAPI: Sendable {
             // Kinds a folder of music files doesn't hold.
             return [Any]()
         case "music/albums/album_tracks":
-            return (await library.album(arguments.string("item_id") ?? "")?.tracks ?? []).map(JSON.track)
+            let id = arguments.string("item_id") ?? ""
+            if let provider = providers.owner(of: id) { return await provider.albumTracks(id).map(JSON.track) }
+            return (await library.album(id)?.tracks ?? []).map(JSON.track)
         case "music/artists/artist_albums":
             return await library.albums(byArtist: arguments.string("item_id") ?? "").map(JSON.album)
 
@@ -163,6 +176,13 @@ struct ServerAPI: Sendable {
         let parts = uri.split(separator: "/").map(String.init)
         guard parts.count >= 3, parts[0] == "library:" else { return [] }
         let id = parts[2]
+        if let provider = providers.owner(of: id) {
+            switch parts[1] {
+            case "track": return [await provider.track(id)].compactMap { $0 }
+            case "album": return await provider.albumTracks(id)
+            default: return []
+            }
+        }
         switch parts[1] {
         case "track": return [await library.track(id)].compactMap { $0 }
         case "album": return await library.album(id)?.tracks ?? []

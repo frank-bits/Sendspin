@@ -6,10 +6,11 @@ import UniformTypeIdentifiers
 enum JSON {
     static func track(_ track: LibraryTrack) -> [String: Any] {
         var item = base(id: track.id, name: track.title, type: "track", image: track.albumID)
+        if let picture = remote(track.artwork) { item["image"] = picture }
         item["duration"] = track.duration
         item["artists"] = [reference(id: track.artistID, name: track.artist, type: "artist")]
         var album = reference(id: track.albumID, name: track.album, type: "album")
-        album["image"] = image(track.albumID)
+        album["image"] = image(of: track)
         item["album"] = album
         if let number = track.trackNumber { item["track_number"] = number }
         if let disc = track.discNumber { item["disc_number"] = disc }
@@ -19,6 +20,7 @@ enum JSON {
 
     static func album(_ album: LibraryAlbum) -> [String: Any] {
         var item = base(id: album.id, name: album.name, type: "album", image: album.id)
+        if let picture = remote(album.artwork) { item["image"] = picture }
         item["artists"] = [reference(id: Library.identifier("artist", album.artist), name: album.artist, type: "artist")]
         if let year = album.year { item["year"] = year }
         return item
@@ -42,7 +44,7 @@ enum JSON {
         if let current = snapshot.current {
             queue["current_item"] = [
                 "queue_item_id": current.id, "name": "\(current.artist) - \(current.title)",
-                "duration": current.duration, "media_item": track(current), "image": image(current.albumID),
+                "duration": current.duration, "media_item": track(current), "image": image(of: current),
             ] as [String: Any]
         }
         return queue
@@ -57,6 +59,15 @@ enum JSON {
 
     private static func reference(id: String, name: String, type: String) -> [String: Any] {
         ["item_id": id, "provider": "library", "name": name, "media_type": type, "uri": "library://\(type)/\(id)"]
+    }
+
+    /// A streamed item's picture, which the app fetches from where it is.
+    private static func remote(_ address: String?) -> [String: Any]? {
+        address.map { ["type": "thumb", "path": $0, "provider": "library", "remotely_accessible": true] }
+    }
+
+    private static func image(of track: LibraryTrack) -> [String: Any] {
+        remote(track.artwork) ?? image(track.albumID)
     }
 
     /// An image served from `/imageproxy/<id>`.

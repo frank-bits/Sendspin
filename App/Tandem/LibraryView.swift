@@ -79,11 +79,14 @@ struct LibraryView: View {
             } else {
                 Button("Sign Out", role: .destructive) { library.signOut() }
             }
+            // An Apple TV has no web view to show it in.
+            #if !os(tvOS)
             if let server = library.server {
                 NavigationLink(value: LibraryRoute.web(server)) {
                     Label("Open Music Assistant", systemImage: "globe")
                 }
             }
+            #endif
         } label: {
             Label("Account", systemImage: "person.crop.circle")
         }
@@ -92,7 +95,11 @@ struct LibraryView: View {
     @ViewBuilder private func destination(_ route: LibraryRoute) -> some View {
         switch route {
         case .web(let url):
+            #if os(tvOS)
+            Text(url.absoluteString)
+            #else
             MusicAssistantWebView(url: url)
+            #endif
         case .list(let type):
             if let api = library.api { MediaListView(type: type, library: library, api: api) }
         case .item(let item):

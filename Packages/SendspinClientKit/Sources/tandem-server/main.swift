@@ -74,12 +74,11 @@ func describe(_ player: StandaloneServer.Player) -> String {
     case .connected?: text += player.paired ? "connected" : "connected, not paired"
     case .pairingRequired?: text += "needs pairing"
     case .notRecognized?: text += "lost its pairing with this server; pair it again"
-    case .awaitingApproval?: text += "waits to be allowed"
+    case .awaitingApproval?: text += "waits to be allowed; 'allow' lets it play"
     case .left?: text += "left the group"
     case .connecting?: text += "connecting"
     case .taken?: text += "in use by another server; 'use' takes it back"
     case .unavailable?: text += "can't be reached"
-    case .notApproved?: text += "isn't the device that was allowed"
     case .disconnected?: text += "not connected"
     case .failed(let reason)?: text += "failed (\(reason))"
     }
