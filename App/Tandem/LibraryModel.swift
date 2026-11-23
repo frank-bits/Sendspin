@@ -39,6 +39,7 @@ final class LibraryModel {
     private(set) var chosenPlayerID: String?
 
     private static let chosenPlayerKey = "LibraryModel.chosenPlayer"
+    private static let playersInterval = Duration.seconds(5)
 
     /// Where picked music plays: the chosen player while the server still offers it,
     /// otherwise this device.
@@ -144,24 +145,39 @@ final class LibraryModel {
 
     // MARK: Playing
 
-    /// Fetch the players music can be sent to, and which of them is this device.
-    func loadPlayers() async {
+    /// Fetch the players music can be sent to, and which of them is this device. A failure
+    /// goes unmentioned when `quietly`, as for a look that's repeated shortly.
+    func loadPlayers(quietly: Bool = false) async {
         guard let api else { return }
         do {
             let all = try await api.players()
+            var own = ownPlayer
             if let clientID = await client.clientID() {
-                ownPlayer = MusicAssistantAPI.player(forSendspinClient: clientID, in: all)
+                own = MusicAssistantAPI.player(forSendspinClient: clientID, in: all)
             }
-            ownGroupName = ownPlayer?.activeGroup.flatMap { id in all.first { $0.playerID == id }?.name }
+            let groupName = own?.activeGroup.flatMap { id in all.first { $0.playerID == id }?.name }
             // This device first and always, then groups, then the other players.
-            let own = ownPlayer?.playerID
-            func rank(_ player: ServerPlayer) -> Int { player.playerID == own ? 0 : player.isGroup ? 1 : 2 }
-            players = all.filter { $0.isSelectable || $0.playerID == own }.sorted {
+            func rank(_ player: ServerPlayer) -> Int { player.playerID == own?.playerID ? 0 : player.isGroup ? 1 : 2 }
+            let selectable = all.filter { $0.isSelectable || $0.playerID == own?.playerID }.sorted {
                 (rank($0), $0.name.lowercased()) < (rank($1), $1.name.lowercased())
             }
+            // Only what changed is set: a menu that's open would redraw for nothing.
+            if ownPlayer != own { ownPlayer = own }
+            if ownGroupName != groupName { ownGroupName = groupName }
+            if players != selectable { players = selectable }
             updateRemote()
         } catch {
-            report(error)
+            if !quietly { report(error) }
+        }
+    }
+
+    /// Keep the players current until cancelled: they come and go at the server without this
+    /// device hearing of it.
+    func followPlayers() async {
+        await loadPlayers()
+        while !Task.isCancelled {
+            try? await Task.sleep(for: Self.playersInterval)
+            if !Task.isCancelled { await loadPlayers(quietly: true) }
         }
     }
 

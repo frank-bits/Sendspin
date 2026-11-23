@@ -242,7 +242,7 @@ struct PlayerPickerBar: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
         .background(Self.bar)
-        .task { await library.loadPlayers() }
+        .task { await library.followPlayers() }
     }
 
     private func title(_ player: ServerPlayer) -> String {
